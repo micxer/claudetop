@@ -2,6 +2,9 @@
 .a5c/
 .parry-guard.redb
 
+# Marketing drafts (local only)
+marketing/
+
 # macOS
 .DS_Store
 
