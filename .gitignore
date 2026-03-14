@@ -1,0 +1,11 @@
+# Babysitter / Parry (local plugin artifacts)
+.a5c/
+.parry-guard.redb
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
