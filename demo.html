@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1b26; padding: 0; font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; }
+  .window {
+    background: #1a1b26;
+    border-radius: 12px;
+    overflow: hidden;
+    width: 880px;
+    margin: 0 auto;
+    border: 1px solid #2a2b3d;
+  }
+  .titlebar {
+    background: #16161e;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot-red { background: #f7768e; }
+  .dot-yellow { background: #e0af68; }
+  .dot-green { background: #9ece6a; }
+  .titlebar-text { color: #565f89; font-size: 12px; margin-left: 12px; }
+  .terminal {
+    padding: 20px 24px;
+    font-size: 13.5px;
+    line-height: 1.7;
+    color: #a9b1d6;
+  }
+  .dim { color: #565f89; }
+  .bold { font-weight: 700; }
+  .blue { color: #7aa2f7; }
+  .cyan { color: #7dcfff; }
+  .green { color: #9ece6a; }
+  .yellow { color: #e0af68; }
+  .red { color: #f7768e; }
+  .magenta { color: #bb9af7; }
+  .gray { color: #565f89; }
+  .white { color: #c0caf5; }
+
+  .section { margin-bottom: 20px; }
+  .section:last-child { margin-bottom: 0; }
+  .label { color: #565f89; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 6px; }
+
+  .prompt {
+    color: #565f89;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #2a2b3d;
+  }
+  .prompt-icon { color: #7aa2f7; }
+
+  .bar-green { color: #9ece6a; }
+  .bar-yellow { color: #e0af68; }
+  .bar-red { color: #f7768e; }
+  .bar-empty { color: #2a2b3d; }
+
+  .divider {
+    border-top: 1px solid #2a2b3d;
+    margin: 16px 0;
+  }
+
+  .response {
+    color: #a9b1d6;
+    margin-bottom: 8px;
+  }
+  .response-text { padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <div class="dot dot-red"></div>
+    <div class="dot dot-yellow"></div>
+    <div class="dot dot-green"></div>
+    <span class="titlebar-text">claude — ~/my-saas</span>
+  </div>
+  <div class="terminal">
+
+    <!-- Claude's response -->
+    <div class="response">
+      <div class="response-text">
+        <span class="white">I've refactored the auth middleware to use JWT verification</span>
+        <span class="white">with automatic token refresh. The session store now uses Redis</span>
+        <span class="white">instead of in-memory storage. Updated 12 files across 3 modules.</span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- claudetop status line -->
+    <div class="section">
+      <!-- Line 1: Context -->
+      <div>
+        <span class="dim">14:32</span>&nbsp;&nbsp;
+        <span class="blue bold">my-saas</span><span class="dim">/src/app</span>&nbsp;&nbsp;
+        <span class="cyan">Opus</span>&nbsp;&nbsp;
+        <span class="dim">22m 15s</span>&nbsp;
+        <span class="dim"><span class="green">+256</span>/<span class="yellow">-43</span></span>&nbsp;
+        <span class="dim">#auth-refactor</span>
+      </div>
+
+      <!-- Line 2: Cost -->
+      <div>
+        <span class="dim">285.0K in / 52.0K out</span>&nbsp;&nbsp;
+        <span class="bar-green">████</span><span class="bar-empty">░░░░░░</span>
+        <span class="dim">38%</span>&nbsp;&nbsp;
+        <span class="green">$4.82</span>&nbsp;&nbsp;
+        <span class="yellow">$6.40/hr</span>&nbsp;&nbsp;
+        <span class="dim">~$192/mo</span>
+      </div>
+
+      <!-- Line 3: Efficiency -->
+      <div>
+        <span class="dim">cache:</span>&nbsp;<span class="green">83%</span>&nbsp;&nbsp;
+        <span class="dim">efficiency:</span>&nbsp;<span class="green">$0.006/line</span>&nbsp;&nbsp;
+        <span class="dim">opus:</span><span class="white bold">~$3.82</span>&nbsp;&nbsp;
+        <span class="dim">sonnet:~$1.08</span>&nbsp;&nbsp;
+        <span class="dim">haiku:~$0.29</span>
+      </div>
+
+      <!-- Line 4: Plugins -->
+      <div>
+        <span class="magenta">main</span><span class="yellow">*</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="green">CI ✓</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="gray">AUTH-2847</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="green">♫</span> <span class="gray">Bonobo — Kerala</span>
+      </div>
+    </div>
+
+    <!-- Prompt -->
+    <div class="prompt">
+      <span class="prompt-icon">❯</span> <span class="dim">|</span>
+    </div>
+  </div>
+</div>
+
+<!-- BAD SESSION -->
+<div style="height: 28px"></div>
+<div class="window">
+  <div class="titlebar">
+    <div class="dot dot-red"></div>
+    <div class="dot dot-yellow"></div>
+    <div class="dot dot-green"></div>
+    <span class="titlebar-text">claude — ~/my-saas</span>
+  </div>
+  <div class="terminal">
+
+    <div class="response">
+      <div class="response-text">
+        <span class="white">Let me research how the existing codebase handles rate limiting...</span>
+        <span class="white">I'll check the middleware chain, the Redis configuration, and the</span>
+        <span class="white">existing test suite to understand the patterns before implementing.</span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="section">
+      <!-- Line 1 -->
+      <div>
+        <span class="dim">16:48</span>&nbsp;&nbsp;
+        <span class="blue bold">my-saas</span>&nbsp;<span class="dim">~/my-saas</span>&nbsp;&nbsp;
+        <span class="cyan">Opus</span>&nbsp;&nbsp;
+        <span class="dim">2h 12m</span>&nbsp;
+        <span class="dim"><span class="green">+80</span>/<span class="yellow">-20</span></span>
+      </div>
+
+      <!-- Line 2 -->
+      <div>
+        <span class="dim">750.0K in / 95.0K out</span>&nbsp;&nbsp;
+        <span class="bar-red">████████</span><span class="bar-empty">░░</span>
+        <span class="dim">82%</span>
+        <span class="red bold"> COMPACT SOON</span>&nbsp;&nbsp;
+        <span class="green">$18.50</span>&nbsp;&nbsp;
+        <span class="red">$8.40/hr</span>
+      </div>
+
+      <!-- Line 3 -->
+      <div>
+        <span class="dim">cache:</span>&nbsp;<span class="red">8%</span>&nbsp;&nbsp;
+        <span class="dim">efficiency:</span>&nbsp;<span class="red">$0.12/line</span>&nbsp;&nbsp;
+        <span class="dim">opus:</span><span class="white bold">~$6.20</span><span class="red">*</span>&nbsp;&nbsp;
+        <span class="dim">sonnet:~$1.75</span>&nbsp;&nbsp;
+        <span class="dim">haiku:~$0.47</span>
+      </div>
+
+      <!-- Line 4: Alerts -->
+      <div>
+        <span class="red bold">$10 MARK</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="yellow">CONSIDER FRESH SESSION</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="red">LOW CACHE</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="cyan">TRY /fast</span>&nbsp;&nbsp;
+        <span class="dim">|</span>&nbsp;&nbsp;
+        <span class="magenta">feat/rate-limit</span><span class="yellow">*</span>
+      </div>
+    </div>
+
+    <div class="prompt">
+      <span class="prompt-icon">❯</span> <span class="dim">|</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

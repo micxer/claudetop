@@ -12,7 +12,7 @@
 ---
 
 <p align="center">
-  <img src="demo.gif" alt="claudetop demo" width="800">
+  <img src="demo.png" alt="claudetop in action — healthy session (top) vs problem session (bottom)" width="800">
 </p>
 
 ```
