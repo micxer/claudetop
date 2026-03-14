@@ -9,6 +9,11 @@
 #   claudetop-stats month        # This month
 #   claudetop-stats all          # All time
 #   claudetop-stats tag <name>   # Filter by tag
+#   claudetop-stats branch       # All branches sorted by cost
+#   claudetop-stats branch <name># Specific branch breakdown
+#   claudetop-stats pr           # Alias for branch
+#   claudetop-stats export csv   # Export all history as CSV
+#   claudetop-stats export json  # Export all history as JSON
 
 set -euo pipefail
 
@@ -65,6 +70,10 @@ fmt_duration_ms() {
 
 MODE="${1:-today}"
 TAG_FILTER=""
+BRANCH_FILTER=""
+EXPORT_FORMAT=""
+EXPORT_SINCE="1970-01-01T00:00:00Z"
+EXPORT_TAG=""
 
 case "$MODE" in
   today|week|month|all) ;;
@@ -75,8 +84,44 @@ case "$MODE" in
       exit 1
     fi
     ;;
+  branch|pr)
+    BRANCH_FILTER="${2:-}"
+    ;;
+  export)
+    EXPORT_FORMAT="${2:-}"
+    if [[ "$EXPORT_FORMAT" != "csv" && "$EXPORT_FORMAT" != "json" ]]; then
+      echo "Usage: claudetop-stats export [csv|json] [--today|--week|--month] [--tag <name>]" >&2
+      exit 1
+    fi
+    # parse remaining flags
+    shift 2 || true
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --today)
+          EXPORT_SINCE=$(date -u +%Y-%m-%dT00:00:00Z)
+          ;;
+        --week)
+          EXPORT_SINCE=$(date -u -v-7d +%Y-%m-%dT00:00:00Z 2>/dev/null \
+            || date -u --date="7 days ago" +%Y-%m-%dT00:00:00Z)
+          ;;
+        --month)
+          EXPORT_SINCE=$(date -u -v-30d +%Y-%m-%dT00:00:00Z 2>/dev/null \
+            || date -u --date="30 days ago" +%Y-%m-%dT00:00:00Z)
+          ;;
+        --tag)
+          EXPORT_TAG="${2:-}"
+          shift
+          ;;
+        *)
+          echo "${RED}Error:${RESET} unknown export flag: $1" >&2
+          exit 1
+          ;;
+      esac
+      shift
+    done
+    ;;
   *)
-    echo "Usage: claudetop-stats [today|week|month|all|tag <name>]" >&2
+    echo "Usage: claudetop-stats [today|week|month|all|tag <name>|branch [<name>]|pr [<name>]|export csv|json]" >&2
     exit 1
     ;;
 esac
@@ -88,6 +133,160 @@ if [[ ! -f "$HISTORY_FILE" || ! -s "$HISTORY_FILE" ]]; then
   echo "  ${DIM}No session history yet.${RESET}"
   echo "  ${DIM}Install the SessionEnd hook to start collecting data:${RESET}"
   echo "  ${DIM}  hooks/session-end.sh${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── export mode ───────────────────────────────────────────────────────────────
+
+if [[ "$MODE" == "export" ]]; then
+  EXPORT_DATA=$(jq -c \
+    --arg since "$EXPORT_SINCE" \
+    --arg tag "$EXPORT_TAG" \
+    'select(.timestamp >= $since) | select(if $tag != "" then .tag == $tag else true end)' \
+    "$HISTORY_FILE")
+
+  if [[ "$EXPORT_FORMAT" == "json" ]]; then
+    echo "$EXPORT_DATA" | jq -s '.'
+    exit 0
+  fi
+
+  # CSV format
+  echo "timestamp,session_id,project,branch,model,duration_min,cost_usd,input_tokens,output_tokens,lines_added,lines_removed,context_used_pct,tag"
+  echo "$EXPORT_DATA" | jq -r '
+    [
+      .timestamp,
+      .session_id,
+      .project,
+      (.branch // ""),
+      .model,
+      ((.duration_ms // 0) / 60000 | round),
+      .cost_usd,
+      (.input_tokens // 0),
+      (.output_tokens // 0),
+      (.lines_added // 0),
+      (.lines_removed // 0),
+      (.context_used_pct // 0),
+      (.tag // "")
+    ] | @csv
+  '
+  exit 0
+fi
+
+# ── branch/pr mode ────────────────────────────────────────────────────────────
+
+if [[ "$MODE" == "branch" || "$MODE" == "pr" ]]; then
+  HR="${DIM}──────────────────────────────────────────────────────${RESET}"
+
+  ALL_SESSIONS=$(jq -c '.' "$HISTORY_FILE")
+
+  if [[ -n "$BRANCH_FILTER" ]]; then
+    # detailed view for a specific branch
+    BRANCH_DATA=$(echo "$ALL_SESSIONS" | jq -c \
+      --arg branch "$BRANCH_FILTER" \
+      'select((.branch // "") == $branch)')
+
+    COUNT=$(echo "$BRANCH_DATA" | grep -c . 2>/dev/null || true)
+
+    if [[ "$COUNT" -eq 0 ]]; then
+      echo ""
+      echo "  ${DIM}No sessions found for branch: ${BRANCH_FILTER}${RESET}"
+      echo ""
+      exit 0
+    fi
+
+    BRANCH_STATS=$(echo "$BRANCH_DATA" | jq -s '
+    {
+      sessions:     length,
+      total_cost:   ([.[].cost_usd] | add),
+      avg_cost:     ([.[].cost_usd] | add / length),
+      total_dur_ms: ([.[].duration_ms] | add),
+      lines_add:    ([.[].lines_added] | add),
+      lines_rm:     ([.[].lines_removed] | add)
+    }
+    ')
+
+    TOTAL_COST=$(echo "$BRANCH_STATS" | jq '.total_cost')
+    AVG_COST=$(echo "$BRANCH_STATS"   | jq '.avg_cost')
+    TOTAL_DUR=$(echo "$BRANCH_STATS"  | jq '.total_dur_ms | floor | tonumber')
+    LINES_ADD=$(echo "$BRANCH_STATS"  | jq '.lines_add')
+    LINES_RM=$(echo "$BRANCH_STATS"   | jq '.lines_rm')
+    SESS_COUNT=$(echo "$BRANCH_STATS" | jq '.sessions')
+
+    echo ""
+    echo "  ${BOLD}${CYAN}claudetop-stats${RESET}  ${BOLD}${WHITE}Branch: ${BRANCH_FILTER}${RESET}"
+    echo "  $HR"
+    echo ""
+    echo "  ${BOLD}Sessions${RESET}"
+
+    echo "$ALL_SESSIONS" | jq -r \
+      --arg branch "$BRANCH_FILTER" \
+      'select((.branch // "") == $branch) | "\(.timestamp)\t\(.cost_usd)\t\(.duration_ms)\t\(.lines_added)\t\(.lines_removed)\t\(.model)"' \
+    | while IFS=$'\t' read -r TS COST DUR LA LR MODEL; do
+        printf "    ${DIM}%s${RESET}  ${YELLOW}%s${RESET}  ${MAGENTA}%s${RESET}  ${GREEN}+%s${RESET}/${RED}-%s${RESET}  ${DIM}%s${RESET}\n" \
+          "$TS" "$(fmt_cost "$COST")" "$(fmt_duration_ms "$DUR")" "$LA" "$LR" "$MODEL"
+      done
+
+    echo ""
+    echo "  ${BOLD}Totals${RESET}"
+    printf "    Sessions:       ${GREEN}%s${RESET}\n"   "$SESS_COUNT"
+    printf "    Total cost:     ${YELLOW}%s${RESET}\n"  "$(fmt_cost "$TOTAL_COST")"
+    printf "    Avg / session:  ${YELLOW}%s${RESET}\n"  "$(fmt_cost "$AVG_COST")"
+    printf "    Total duration: ${MAGENTA}%s${RESET}\n" "$(fmt_duration_ms "$TOTAL_DUR")"
+    printf "    Lines changed:  ${GREEN}+%s${RESET} / ${RED}-%s${RESET}\n" "$LINES_ADD" "$LINES_RM"
+    echo ""
+    printf "  ${BOLD}PR cost estimate: ${YELLOW}%s${RESET}${RESET}\n" "$(fmt_cost "$TOTAL_COST")"
+    echo ""
+    echo "  $HR"
+    echo "  ${DIM}History: $HISTORY_FILE${RESET}"
+    echo ""
+    exit 0
+  fi
+
+  # all-branches view
+  BRANCH_SUMMARY=$(echo "$ALL_SESSIONS" | jq -s '
+    group_by(.branch // "")
+    | map({
+        branch:      (.[0].branch // ""),
+        cost:        ([.[].cost_usd]   | add),
+        sessions:    length,
+        lines_add:   ([.[].lines_added]   | add),
+        lines_rm:    ([.[].lines_removed] | add),
+        total_dur_ms:([.[].duration_ms]   | add),
+        first_ts:    (min_by(.timestamp).timestamp),
+        last_ts:     (max_by(.timestamp).timestamp)
+      })
+    | sort_by(-.cost)
+  ')
+
+  BRANCH_COUNT=$(echo "$BRANCH_SUMMARY" | jq 'length')
+
+  echo ""
+  echo "  ${BOLD}${CYAN}claudetop-stats${RESET}  ${BOLD}${WHITE}Branch Cost Analysis${RESET}"
+  echo "  $HR"
+  echo ""
+  printf "  Total branches with sessions: ${GREEN}%s${RESET}\n" "$BRANCH_COUNT"
+  echo ""
+  echo "  ${BOLD}Branches by cost${RESET}"
+
+  echo "$BRANCH_SUMMARY" | jq -r '
+    .[]
+    | "\(.branch)|\(.cost)|\(.sessions)|\(.lines_add)|\(.lines_rm)|\(.total_dur_ms)|\(.first_ts)|\(.last_ts)"
+  ' | while IFS='|' read -r branch cost sess la lr dur first last; do
+      DISPLAY_BRANCH="$branch"
+      [[ -z "$branch" ]] && DISPLAY_BRANCH="(no branch)"
+      printf "    ${CYAN}%-35s${RESET}  ${YELLOW}%s${RESET}  ${DIM}%s sessions${RESET}  ${GREEN}+%s${RESET}/${RED}-%s${RESET}  ${MAGENTA}%s${RESET}  ${DIM}%s → %s${RESET}\n" \
+        "$DISPLAY_BRANCH" \
+        "$(fmt_cost "$cost")" \
+        "$sess" \
+        "$la" "$lr" \
+        "$(fmt_duration_ms "$dur")" \
+        "$first" "$last"
+    done
+
+  echo ""
+  echo "  $HR"
+  echo "  ${DIM}History: $HISTORY_FILE${RESET}"
   echo ""
   exit 0
 fi

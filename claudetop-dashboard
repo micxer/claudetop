@@ -1,0 +1,1040 @@
+#!/bin/bash
+# claudetop-dashboard — Generate an HTML dashboard from session history
+# https://github.com/liorwn/claudetop
+#
+# Usage:
+#   claudetop-dashboard            # Generate and open in browser
+#   claudetop-dashboard --no-open  # Generate only, print path
+
+set -euo pipefail
+
+HISTORY_FILE="${HOME}/.claude/claudetop-history.jsonl"
+OUTPUT_FILE="/tmp/claudetop-dashboard.html"
+NO_OPEN=0
+
+for arg in "$@"; do
+  if [ "$arg" = "--no-open" ]; then
+    NO_OPEN=1
+  fi
+done
+
+# --- Dependency check ---
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq is required. Install with: brew install jq" >&2
+  exit 1
+fi
+
+# --- History file check ---
+if [ ! -f "$HISTORY_FILE" ]; then
+  echo "Error: History file not found at $HISTORY_FILE" >&2
+  echo "Make sure the session-end hook is installed. See the claudetop README." >&2
+  exit 1
+fi
+
+# --- Convert JSONL to JSON array ---
+SESSIONS_JSON=$(jq -s '.' "$HISTORY_FILE" 2>/dev/null) || {
+  echo "Error: Failed to parse history file." >&2
+  exit 1
+}
+
+# --- Generate HTML ---
+cat > "$OUTPUT_FILE" <<'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claudetop dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #1a1b26;
+    --bg2:       #1f2335;
+    --bg3:       #24283b;
+    --border:    #2d3149;
+    --fg:        #a9b1d6;
+    --fg-dim:    #565f89;
+    --blue:      #7aa2f7;
+    --green:     #9ece6a;
+    --yellow:    #e0af68;
+    --red:       #f7768e;
+    --cyan:      #7dcfff;
+    --magenta:   #bb9af7;
+    --orange:    #ff9e64;
+    --white:     #c0caf5;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 13px;
+    min-height: 100vh;
+  }
+
+  header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--blue);
+    letter-spacing: -0.5px;
+    flex-shrink: 0;
+  }
+
+  header h1 span {
+    color: var(--fg-dim);
+    font-weight: 400;
+  }
+
+  .filter-bar {
+    display: flex;
+    gap: 6px;
+  }
+
+  .filter-btn {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: 5px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    transition: all 0.15s;
+  }
+
+  .filter-btn:hover {
+    border-color: var(--blue);
+    color: var(--fg);
+  }
+
+  .filter-btn.active {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: var(--bg);
+    font-weight: 600;
+  }
+
+  main {
+    padding: 20px 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  /* Summary cards */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  @media (max-width: 900px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  @media (max-width: 500px) {
+    .cards { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+
+  .card-label {
+    font-size: 11px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+
+  .card-value {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--white);
+    letter-spacing: -0.5px;
+  }
+
+  .card-sub {
+    font-size: 11px;
+    color: var(--fg-dim);
+    margin-top: 4px;
+  }
+
+  .card:nth-child(1) .card-value { color: var(--blue); }
+  .card:nth-child(2) .card-value { color: var(--yellow); }
+  .card:nth-child(3) .card-value { color: var(--green); }
+  .card:nth-child(4) .card-value { color: var(--cyan); }
+
+  /* Chart grid */
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  @media (max-width: 900px) {
+    .charts { grid-template-columns: 1fr; }
+  }
+
+  .chart-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+
+  .chart-card.wide {
+    grid-column: span 2;
+  }
+
+  @media (max-width: 900px) {
+    .chart-card.wide { grid-column: span 1; }
+  }
+
+  .chart-title {
+    font-size: 12px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 14px;
+  }
+
+  .chart-container {
+    position: relative;
+    height: 220px;
+  }
+
+  .chart-container.tall {
+    height: 280px;
+  }
+
+  /* Session table */
+  .table-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow: hidden;
+  }
+
+  .table-title {
+    font-size: 12px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 14px;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  th {
+    text-align: left;
+    color: var(--fg-dim);
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    font-weight: 500;
+  }
+
+  th:hover { color: var(--blue); }
+
+  th.sort-asc::after { content: " ↑"; color: var(--blue); }
+  th.sort-desc::after { content: " ↓"; color: var(--blue); }
+
+  td {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    color: var(--fg);
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: var(--bg3); }
+  tr:hover td { background: var(--bg3); filter: brightness(1.1); }
+
+  .td-cost   { color: var(--yellow); font-weight: 600; }
+  .td-model  { color: var(--magenta); }
+  .td-branch { color: var(--cyan); }
+  .td-tag    { color: var(--green); }
+  .td-project { color: var(--blue); }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--fg-dim);
+  }
+
+  .empty-state p { font-size: 16px; margin-bottom: 8px; }
+  .empty-state small { font-size: 12px; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>claudetop <span>dashboard</span></h1>
+  <div class="filter-bar">
+    <button class="filter-btn" data-range="today" onclick="setRange('today')">Today</button>
+    <button class="filter-btn active" data-range="week" onclick="setRange('week')">Week</button>
+    <button class="filter-btn" data-range="month" onclick="setRange('month')">Month</button>
+    <button class="filter-btn" data-range="all" onclick="setRange('all')">All</button>
+  </div>
+</header>
+
+<main>
+  <div id="empty-state" class="empty-state" style="display:none">
+    <p>No session data yet.</p>
+    <small>Install the session-end hook so claudetop can record your sessions.</small>
+  </div>
+
+  <div id="dashboard">
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">Total Sessions</div>
+        <div class="card-value" id="stat-sessions">—</div>
+        <div class="card-sub" id="stat-sessions-sub"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Total Cost</div>
+        <div class="card-value" id="stat-cost">—</div>
+        <div class="card-sub" id="stat-cost-sub"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Avg Cost / Session</div>
+        <div class="card-value" id="stat-avg">—</div>
+        <div class="card-sub" id="stat-avg-sub"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Daily Average</div>
+        <div class="card-value" id="stat-daily">—</div>
+        <div class="card-sub" id="stat-daily-sub"></div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="chart-card">
+        <div class="chart-title">Spending Over Time</div>
+        <div class="chart-container"><canvas id="chart-timeline"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Cost by Model</div>
+        <div class="chart-container"><canvas id="chart-model"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Cost by Project (top 10)</div>
+        <div class="chart-container tall"><canvas id="chart-project"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Cost by Branch (top 10)</div>
+        <div class="chart-container tall"><canvas id="chart-branch"></canvas></div>
+      </div>
+      <div class="chart-card wide">
+        <div class="chart-title">Efficiency Trends — Context Used % &amp; Cost/Line</div>
+        <div class="chart-container"><canvas id="chart-efficiency"></canvas></div>
+      </div>
+      <div class="chart-card wide">
+        <div class="chart-title">Session Duration vs Cost</div>
+        <div class="chart-container"><canvas id="chart-scatter"></canvas></div>
+      </div>
+    </div>
+
+    <div class="table-card">
+      <div class="table-title">Sessions</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th onclick="sortTable('timestamp')" id="th-timestamp">Date</th>
+              <th onclick="sortTable('project')" id="th-project">Project</th>
+              <th onclick="sortTable('branch')" id="th-branch">Branch</th>
+              <th onclick="sortTable('model')" id="th-model">Model</th>
+              <th onclick="sortTable('duration_ms')" id="th-duration_ms">Duration</th>
+              <th onclick="sortTable('cost_usd')" id="th-cost_usd">Cost</th>
+              <th onclick="sortTable('lines_total')" id="th-lines_total">Lines</th>
+              <th onclick="sortTable('cache_pct')" id="th-cache_pct">Cache %</th>
+              <th onclick="sortTable('tag')" id="th-tag">Tag</th>
+            </tr>
+          </thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ===== DATA (injected by claudetop-dashboard script) =====
+const ALL_SESSIONS = SESSIONS_PLACEHOLDER;
+
+// ===== PALETTE =====
+const C = {
+  blue:    '#7aa2f7',
+  green:   '#9ece6a',
+  yellow:  '#e0af68',
+  red:     '#f7768e',
+  cyan:    '#7dcfff',
+  magenta: '#bb9af7',
+  orange:  '#ff9e64',
+  fg:      '#a9b1d6',
+  fgDim:   '#565f89',
+  bg2:     '#1f2335',
+  bg3:     '#24283b',
+  border:  '#2d3149',
+};
+
+const MODEL_COLORS = {
+  opus:   C.red,
+  sonnet: C.blue,
+  haiku:  C.green,
+};
+
+const CHART_DEFAULTS = {
+  color: C.fg,
+  borderColor: C.border,
+  plugins: {
+    legend: {
+      labels: { color: C.fg, font: { family: "'SF Mono','Fira Code',monospace", size: 11 } }
+    },
+    tooltip: {
+      backgroundColor: '#1a1b26',
+      borderColor: C.border,
+      borderWidth: 1,
+      titleColor: C.fg,
+      bodyColor: C.fg,
+    }
+  },
+  scales: {
+    x: {
+      ticks: { color: C.fgDim, font: { size: 11 } },
+      grid:  { color: C.border },
+    },
+    y: {
+      ticks: { color: C.fgDim, font: { size: 11 } },
+      grid:  { color: C.border },
+    }
+  }
+};
+
+Chart.defaults.color = C.fg;
+Chart.defaults.borderColor = C.border;
+
+// ===== STATE =====
+let currentRange = 'week';
+let currentSort  = { key: 'timestamp', dir: 'desc' };
+let charts = {};
+
+// ===== FILTERING =====
+function filterByRange(sessions, range) {
+  const now = new Date();
+  return sessions.filter(s => {
+    const ts = new Date(s.timestamp);
+    if (range === 'today') {
+      return ts.toDateString() === now.toDateString();
+    }
+    if (range === 'week') {
+      const cutoff = new Date(now);
+      cutoff.setDate(cutoff.getDate() - 7);
+      return ts >= cutoff;
+    }
+    if (range === 'month') {
+      const cutoff = new Date(now);
+      cutoff.setDate(cutoff.getDate() - 30);
+      return ts >= cutoff;
+    }
+    return true;
+  });
+}
+
+function setRange(range) {
+  currentRange = range;
+  document.querySelectorAll('.filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.range === range);
+  });
+  render();
+}
+
+// ===== HELPERS =====
+function fmtCost(v) {
+  if (v == null || isNaN(v)) return '$0.000';
+  return v >= 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(3)}`;
+}
+
+function fmtDuration(ms) {
+  const s = Math.floor((ms || 0) / 1000);
+  if (s >= 3600) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+  if (s >= 60)   return `${Math.floor(s/60)}m ${s%60}s`;
+  return `${s}s`;
+}
+
+function fmtTokens(n) {
+  if (n >= 1e6) return `${(n/1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n/1e3).toFixed(1)}K`;
+  return String(n || 0);
+}
+
+function shortModel(m) {
+  if (!m) return 'unknown';
+  if (m.includes('opus'))   return 'Opus';
+  if (m.includes('sonnet')) return 'Sonnet';
+  if (m.includes('haiku'))  return 'Haiku';
+  return m.split('-').slice(0,2).join('-');
+}
+
+function modelFamily(m) {
+  if (!m) return 'other';
+  if (m.includes('opus'))   return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku'))  return 'haiku';
+  return 'other';
+}
+
+function colorForModel(m) {
+  return MODEL_COLORS[modelFamily(m)] || C.orange;
+}
+
+function topN(map, n) {
+  return Object.entries(map)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n);
+}
+
+function groupByDate(sessions) {
+  const map = {};
+  sessions.forEach(s => {
+    const d = (s.timestamp || '').slice(0, 10);
+    if (!d) return;
+    map[d] = (map[d] || 0) + (s.cost_usd || 0);
+  });
+  return map;
+}
+
+function destroyChart(id) {
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+}
+
+// ===== SUMMARY CARDS =====
+function updateCards(sessions) {
+  const total  = sessions.reduce((a, s) => a + (s.cost_usd || 0), 0);
+  const avg    = sessions.length ? total / sessions.length : 0;
+
+  const days   = new Set(sessions.map(s => (s.timestamp||'').slice(0,10))).size;
+  const daily  = days ? total / days : 0;
+
+  document.getElementById('stat-sessions').textContent = sessions.length;
+  document.getElementById('stat-sessions-sub').textContent =
+    sessions.length === 1 ? '1 session' : `across ${days} day${days !== 1 ? 's' : ''}`;
+
+  document.getElementById('stat-cost').textContent = fmtCost(total);
+  document.getElementById('stat-cost-sub').textContent =
+    sessions.length ? `${fmtTokens(sessions.reduce((a,s)=>a+(s.input_tokens||0),0))} input tokens` : '';
+
+  document.getElementById('stat-avg').textContent  = fmtCost(avg);
+  document.getElementById('stat-avg-sub').textContent =
+    `median: ${fmtCost(median(sessions.map(s=>s.cost_usd||0)))}`;
+
+  document.getElementById('stat-daily').textContent = fmtCost(daily);
+  document.getElementById('stat-daily-sub').textContent =
+    days ? `~$${(daily * 30).toFixed(0)}/mo projected` : '';
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a,b)=>a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
+}
+
+// ===== CHART: TIMELINE =====
+function drawTimeline(sessions) {
+  destroyChart('timeline');
+  const dateMap = groupByDate(sessions);
+  const labels  = Object.keys(dateMap).sort();
+  const data    = labels.map(d => dateMap[d]);
+
+  charts.timeline = new Chart(
+    document.getElementById('chart-timeline').getContext('2d'),
+    {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Cost ($)',
+          data,
+          borderColor: C.blue,
+          backgroundColor: 'rgba(122,162,247,0.10)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3,
+          pointHoverRadius: 5,
+          pointBackgroundColor: C.blue,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          legend: { display: false },
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: { label: ctx => ` ${fmtCost(ctx.parsed.y)}` }
+          }
+        },
+        scales: {
+          x: { ...CHART_DEFAULTS.scales.x, ticks: { ...CHART_DEFAULTS.scales.x.ticks, maxTicksLimit: 8 } },
+          y: { ...CHART_DEFAULTS.scales.y, ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => `$${v.toFixed(2)}` } }
+        }
+      }
+    }
+  );
+}
+
+// ===== CHART: MODEL DONUT =====
+function drawModel(sessions) {
+  destroyChart('model');
+  const map = {};
+  sessions.forEach(s => {
+    const fam = modelFamily(s.model);
+    map[fam] = (map[fam] || 0) + (s.cost_usd || 0);
+  });
+  const labels = Object.keys(map);
+  const data   = labels.map(k => map[k]);
+  const colors = labels.map(k => MODEL_COLORS[k] || C.orange);
+
+  charts.model = new Chart(
+    document.getElementById('chart-model').getContext('2d'),
+    {
+      type: 'doughnut',
+      data: {
+        labels: labels.map(l => l.charAt(0).toUpperCase() + l.slice(1)),
+        datasets: [{
+          data,
+          backgroundColor: colors.map(c => c + 'cc'),
+          borderColor:     colors,
+          borderWidth: 2,
+          hoverOffset: 6,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '65%',
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          legend: {
+            position: 'right',
+            labels: { color: C.fg, font: { size: 11 }, padding: 14 }
+          },
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: { label: ctx => ` ${ctx.label}: ${fmtCost(ctx.parsed)}` }
+          }
+        }
+      }
+    }
+  );
+}
+
+// ===== CHART: PROJECT BAR =====
+function drawProject(sessions) {
+  destroyChart('project');
+  const map = {};
+  sessions.forEach(s => {
+    const p = s.project || '(unknown)';
+    map[p] = (map[p] || 0) + (s.cost_usd || 0);
+  });
+  const pairs  = topN(map, 10).reverse();
+  const labels = pairs.map(p => p[0]);
+  const data   = pairs.map(p => p[1]);
+
+  charts.project = new Chart(
+    document.getElementById('chart-project').getContext('2d'),
+    {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Cost ($)',
+          data,
+          backgroundColor: C.blue + 'bb',
+          borderColor: C.blue,
+          borderWidth: 1,
+          borderRadius: 3,
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          legend: { display: false },
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: { label: ctx => ` ${fmtCost(ctx.parsed.x)}` }
+          }
+        },
+        scales: {
+          x: { ...CHART_DEFAULTS.scales.x, ticks: { ...CHART_DEFAULTS.scales.x.ticks, callback: v => `$${v.toFixed(2)}` } },
+          y: { ...CHART_DEFAULTS.scales.y }
+        }
+      }
+    }
+  );
+}
+
+// ===== CHART: BRANCH BAR =====
+function drawBranch(sessions) {
+  destroyChart('branch');
+  const map = {};
+  sessions.forEach(s => {
+    const b = s.branch && s.branch.trim() ? s.branch : '(no branch)';
+    map[b] = (map[b] || 0) + (s.cost_usd || 0);
+  });
+  const pairs  = topN(map, 10).reverse();
+  const labels = pairs.map(p => p[0]);
+  const data   = pairs.map(p => p[1]);
+
+  charts.branch = new Chart(
+    document.getElementById('chart-branch').getContext('2d'),
+    {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Cost ($)',
+          data,
+          backgroundColor: C.cyan + 'bb',
+          borderColor: C.cyan,
+          borderWidth: 1,
+          borderRadius: 3,
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          legend: { display: false },
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: { label: ctx => ` ${fmtCost(ctx.parsed.x)}` }
+          }
+        },
+        scales: {
+          x: { ...CHART_DEFAULTS.scales.x, ticks: { ...CHART_DEFAULTS.scales.x.ticks, callback: v => `$${v.toFixed(2)}` } },
+          y: { ...CHART_DEFAULTS.scales.y }
+        }
+      }
+    }
+  );
+}
+
+// ===== CHART: EFFICIENCY LINE (dual y-axis) =====
+function drawEfficiency(sessions) {
+  destroyChart('efficiency');
+  const dateMap = {};
+  sessions.forEach(s => {
+    const d = (s.timestamp || '').slice(0, 10);
+    if (!d) return;
+    if (!dateMap[d]) dateMap[d] = { costPctSum: 0, cplSum: 0, n: 0, linesN: 0 };
+    // context_used_pct tracks how full the context window was at session end
+    dateMap[d].cachePctSum += (s.context_used_pct || 0);
+    const lines = (s.lines_added || 0) + (s.lines_removed || 0);
+    if (lines > 0) {
+      dateMap[d].cplSum += (s.cost_usd || 0) / lines;
+      dateMap[d].linesN++;
+    }
+    dateMap[d].n++;
+  });
+
+  const labels   = Object.keys(dateMap).sort();
+  const ctxData  = labels.map(d => dateMap[d].n ? dateMap[d].cachePctSum / dateMap[d].n : null);
+  const cplData  = labels.map(d => dateMap[d].linesN ? dateMap[d].cplSum / dateMap[d].linesN : null);
+
+  charts.efficiency = new Chart(
+    document.getElementById('chart-efficiency').getContext('2d'),
+    {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Context Used %',
+            data: ctxData,
+            borderColor: C.magenta,
+            backgroundColor: 'rgba(187,154,247,0.08)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            yAxisID: 'yLeft',
+          },
+          {
+            label: 'Cost/Line ($)',
+            data: cplData,
+            borderColor: C.yellow,
+            backgroundColor: 'rgba(224,175,104,0.08)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            yAxisID: 'yRight',
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: {
+              label: ctx => {
+                if (ctx.dataset.yAxisID === 'yLeft') return ` Context: ${(ctx.parsed.y||0).toFixed(1)}%`;
+                return ` Cost/Line: ${fmtCost(ctx.parsed.y)}`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: { ...CHART_DEFAULTS.scales.x, ticks: { ...CHART_DEFAULTS.scales.x.ticks, maxTicksLimit: 8 } },
+          yLeft: {
+            type: 'linear',
+            position: 'left',
+            ticks: { color: C.magenta, font: { size: 11 }, callback: v => `${v}%` },
+            grid: { color: C.border },
+          },
+          yRight: {
+            type: 'linear',
+            position: 'right',
+            ticks: { color: C.yellow, font: { size: 11 }, callback: v => `$${v.toFixed(3)}` },
+            grid: { drawOnChartArea: false },
+          }
+        }
+      }
+    }
+  );
+}
+
+// ===== CHART: SCATTER =====
+function drawScatter(sessions) {
+  destroyChart('scatter');
+  const families = ['opus', 'sonnet', 'haiku', 'other'];
+  const datasets = families.map(fam => {
+    const pts = sessions
+      .filter(s => modelFamily(s.model) === fam)
+      .map(s => ({
+        x: (s.duration_ms || 0) / 60000,  // minutes
+        y: s.cost_usd || 0,
+        label: `${s.project || 'unknown'} — ${fmtCost(s.cost_usd)} / ${fmtDuration(s.duration_ms)}`
+      }));
+    if (!pts.length) return null;
+    const col = MODEL_COLORS[fam] || C.orange;
+    return {
+      label: fam.charAt(0).toUpperCase() + fam.slice(1),
+      data: pts,
+      backgroundColor: col + '99',
+      borderColor: col,
+      borderWidth: 1,
+      pointRadius: 5,
+      pointHoverRadius: 7,
+    };
+  }).filter(Boolean);
+
+  charts.scatter = new Chart(
+    document.getElementById('chart-scatter').getContext('2d'),
+    {
+      type: 'scatter',
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          ...CHART_DEFAULTS.plugins,
+          tooltip: {
+            ...CHART_DEFAULTS.plugins.tooltip,
+            callbacks: {
+              label: ctx => ` ${ctx.raw.label}`
+            }
+          }
+        },
+        scales: {
+          x: { ...CHART_DEFAULTS.scales.x, title: { display: true, text: 'Duration (min)', color: C.fgDim }, ticks: { ...CHART_DEFAULTS.scales.x.ticks, callback: v => `${v}m` } },
+          y: { ...CHART_DEFAULTS.scales.y, title: { display: true, text: 'Cost', color: C.fgDim }, ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => `$${v.toFixed(2)}` } }
+        }
+      }
+    }
+  );
+}
+
+// ===== TABLE =====
+function sortTable(key) {
+  if (currentSort.key === key) {
+    currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    currentSort = { key, dir: key === 'timestamp' ? 'desc' : 'desc' };
+  }
+  const sessions = filterByRange(ALL_SESSIONS, currentRange);
+  renderTable(sessions);
+  document.querySelectorAll('th').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+  });
+  const th = document.getElementById(`th-${key}`);
+  if (th) th.classList.add(currentSort.dir === 'asc' ? 'sort-asc' : 'sort-desc');
+}
+
+function renderTable(sessions) {
+  const sorted = [...sessions].sort((a, b) => {
+    const k = currentSort.key;
+    let va, vb;
+    if (k === 'lines_total') {
+      va = (a.lines_added||0) + (a.lines_removed||0);
+      vb = (b.lines_added||0) + (b.lines_removed||0);
+    } else if (k === 'cache_pct') {
+      va = a.context_used_pct || 0;
+      vb = b.context_used_pct || 0;
+    } else {
+      va = a[k] ?? '';
+      vb = b[k] ?? '';
+    }
+    if (va < vb) return currentSort.dir === 'asc' ? -1 : 1;
+    if (va > vb) return currentSort.dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const body = document.getElementById('table-body');
+  body.innerHTML = sorted.map(s => {
+    const date     = s.timestamp ? s.timestamp.replace('T', ' ').replace('Z','').slice(0,16) : '—';
+    const project  = s.project  || '—';
+    const branch   = (s.branch && s.branch.trim()) ? s.branch : '';
+    const model    = shortModel(s.model);
+    const dur      = fmtDuration(s.duration_ms);
+    const cost     = fmtCost(s.cost_usd);
+    const lines    = (s.lines_added||0) + (s.lines_removed||0);
+    const linesStr = lines ? `+${s.lines_added||0}/-${s.lines_removed||0}` : '—';
+    const ctx      = s.context_used_pct != null ? `${s.context_used_pct}%` : '—';
+    const tag      = s.tag || '';
+    return `<tr>
+      <td>${date}</td>
+      <td class="td-project">${project}</td>
+      <td class="td-branch">${branch}</td>
+      <td class="td-model">${model}</td>
+      <td>${dur}</td>
+      <td class="td-cost">${cost}</td>
+      <td>${linesStr}</td>
+      <td>${ctx}</td>
+      <td class="td-tag">${tag}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ===== MAIN RENDER =====
+function render() {
+  const sessions = filterByRange(ALL_SESSIONS, currentRange);
+
+  if (ALL_SESSIONS.length === 0) {
+    document.getElementById('empty-state').style.display = 'block';
+    document.getElementById('dashboard').style.display  = 'none';
+    return;
+  }
+
+  document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('dashboard').style.display  = 'block';
+
+  updateCards(sessions);
+  drawTimeline(sessions);
+  drawModel(sessions);
+  drawProject(sessions);
+  drawBranch(sessions);
+  drawEfficiency(sessions);
+  drawScatter(sessions);
+  renderTable(sessions);
+
+  // Mark active sort header
+  document.querySelectorAll('th').forEach(th => th.classList.remove('sort-asc','sort-desc'));
+  const thEl = document.getElementById(`th-${currentSort.key}`);
+  if (thEl) thEl.classList.add(currentSort.dir === 'asc' ? 'sort-asc' : 'sort-desc');
+}
+
+// ===== INIT =====
+render();
+</script>
+</body>
+</html>
+HTMLEOF
+
+# --- Inject the sessions JSON into the HTML ---
+# Write JSON to a temp file so Python reads it directly — avoids shell
+# interpolation issues with backslashes, backticks, or multi-line strings.
+JSON_TMP=$(mktemp /tmp/claudetop-sessions.XXXXXX.json)
+printf '%s' "$SESSIONS_JSON" > "$JSON_TMP"
+
+python3 - "$OUTPUT_FILE" "$JSON_TMP" <<'PYEOF'
+import sys, json
+
+output_path  = sys.argv[1]
+json_path    = sys.argv[2]
+
+with open(json_path, 'r') as f:
+    raw = f.read()
+
+# Validate JSON is parseable before embedding
+try:
+    json.loads(raw)
+except Exception as e:
+    print(f"Warning: JSON parse issue: {e}", file=sys.stderr)
+
+with open(output_path, 'r') as f:
+    html = f.read()
+
+html = html.replace('SESSIONS_PLACEHOLDER', raw, 1)
+
+with open(output_path, 'w') as f:
+    f.write(html)
+
+import os
+os.unlink(json_path)
+PYEOF
+
+echo "$OUTPUT_FILE"
+
+if [ "$NO_OPEN" -eq 0 ]; then
+  if command -v open &>/dev/null; then
+    open "$OUTPUT_FILE"
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "$OUTPUT_FILE"
+  fi
+fi

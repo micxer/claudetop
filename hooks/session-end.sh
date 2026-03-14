@@ -10,9 +10,17 @@ set -euo pipefail
 HISTORY_FILE="$HOME/.claude/claudetop-history.jsonl"
 JSON=$(cat)
 
+# Detect git branch from project directory
+PROJECT_DIR=$(echo "$JSON" | jq -r '.workspace.project_dir // .cwd // ""')
+GIT_BRANCH=""
+if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR/.git" ]; then
+  GIT_BRANCH=$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
+fi
+
 jq -c \
   --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg tag "${CLAUDETOP_TAG:-}" \
+  --arg branch "$GIT_BRANCH" \
   '{
     timestamp:       $timestamp,
     session_id:      (.session_id // ""),
@@ -26,5 +34,6 @@ jq -c \
     lines_added:     (.cost.total_lines_added // 0),
     lines_removed:   (.cost.total_lines_removed // 0),
     context_used_pct:(.context_window.used_percentage // 0),
-    tag:             $tag
+    tag:             $tag,
+    branch:          $branch
   }' <<< "$JSON" >> "$HISTORY_FILE"
