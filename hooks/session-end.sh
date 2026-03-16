@@ -38,28 +38,28 @@ jq -c \
     branch:          $branch
   }' <<< "$JSON" >> "$HISTORY_FILE"
 
-# Update iTerm2 state to "session ended" — green tint, title shows "idle"
+# Reset iTerm2 terminal on session end — back to default colors, clear title/badge
 if [ -n "${CLAUDETOP_ITERM:-}" ]; then
-  ITERM_STATE_FILE="$HOME/.claude/claudetop-iterm-state.${ITERM_SESSION_ID:-default}"
-  PROJECT_NAME=$(echo "$JSON" | jq -r '((.workspace.project_dir // .cwd // "") | split("/") | last)')
-  COST_USD=$(echo "$JSON" | jq -r '.cost.total_cost_usd // 0')
-  PLAIN_COST=$(printf "$%.2f" "$COST_USD")
-  MODEL=$(echo "$JSON" | jq -r '.model.display_name // "unknown"')
-  {
-    echo "iterm_session=${ITERM_SESSION_ID:-}"
-    echo "timestamp=$(date +%s)"
-    echo "project=${PROJECT_NAME}"
-    echo "model=${MODEL}"
-    echo "cost=${PLAIN_COST}"
-    echo "velocity="
-    echo "ctx=0"
-    echo "cache=0"
-    echo "duration=done"
-    echo "tokens_in=0"
-    echo "tokens_out=0"
-    echo "lines_added=0"
-    echo "lines_removed=0"
-    echo "bgcolor=152b17"
-    echo "modes=${CLAUDETOP_ITERM}"
-  } > "$ITERM_STATE_FILE"
+  # Write directly to TTY for instant reset
+  TTY_MAP="$HOME/.claude/claudetop-iterm-ttys"
+  SESSION_ID="${ITERM_SESSION_ID:-}"
+  if [ -z "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
+    PARENT_TTY=$(ps -p $PPID -o tty= 2>/dev/null | tr -d ' ')
+    if [ -n "$PARENT_TTY" ]; then
+      PARENT_TTY="/dev/${PARENT_TTY}"
+      SESSION_ID=$(grep "=${PARENT_TTY}$" "$TTY_MAP" 2>/dev/null | head -1 | cut -d= -f1)
+    fi
+  fi
+  if [ -n "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
+    MY_TTY=$(grep "^${SESSION_ID}=" "$TTY_MAP" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [ -n "$MY_TTY" ] && [ -w "$MY_TTY" ]; then
+      printf "\033]1337;SetColors=bg=default\007" > "$MY_TTY"
+      printf "\033]1;\007" > "$MY_TTY"
+      printf "\033]1337;SetBadgeFormat=\007" > "$MY_TTY"
+    fi
+  fi
+
+  # Mark state file as stale so watcher stops
+  ITERM_STATE_FILE="$HOME/.claude/claudetop-iterm-state.${SESSION_ID:-default}"
+  echo "timestamp=0" > "$ITERM_STATE_FILE"
 fi
