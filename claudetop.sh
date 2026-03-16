@@ -603,11 +603,8 @@ if [ -n "$ITERM_MODE" ]; then
     PLAIN_VELOCITY="\$${RATE}/hr"
   fi
 
-  # Read existing bgcolor BEFORE overwriting (hooks set green/black between renders)
-  EXISTING_BG=""
-  if iterm_wants "bgcolor"; then
-    EXISTING_BG=$(grep "^bgcolor=" "$ITERM_STATE_FILE" 2>/dev/null | cut -d= -f2)
-  fi
+  # Status line only runs during active responses — always set black.
+  # Stop hook sets green AFTER the last render, so it won't be overwritten.
 
   # Build state file — one key=value per line, read by the watcher
   {
@@ -625,7 +622,7 @@ if [ -n "$ITERM_MODE" ]; then
     echo "lines_added=${LINES_ADDED}"
     echo "lines_removed=${LINES_REMOVED}"
     [ -n "${CLAUDETOP_TAG:-}" ] && echo "tag=${CLAUDETOP_TAG}"
-    echo "bgcolor=${EXISTING_BG:-000000}"
+    echo "bgcolor=000000"
     echo "modes=${ITERM_MODE}"
   } > "$ITERM_STATE_FILE"
 fi

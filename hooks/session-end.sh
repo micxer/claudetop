@@ -38,40 +38,23 @@ jq -c \
     branch:          $branch
   }' <<< "$JSON" >> "$HISTORY_FILE"
 
-# Reset iTerm2 terminal on session end — back to default colors, clear title/badge
-if [ -n "${CLAUDETOP_ITERM:-}" ]; then
-  TTY_MAP="$HOME/.claude/claudetop-iterm-ttys"
-  SESSION_ID="${ITERM_SESSION_ID:-}"
-
-  # Try PPID fallback if no session ID in env
-  if [ -z "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
-    PARENT_TTY=$(ps -p $PPID -o tty= 2>/dev/null | tr -d ' ')
-    if [ -n "$PARENT_TTY" ] && [ "$PARENT_TTY" != "??" ]; then
-      PARENT_TTY="/dev/${PARENT_TTY}"
-      SESSION_ID=$(grep "=${PARENT_TTY}$" "$TTY_MAP" 2>/dev/null | head -1 | cut -d= -f1)
-    fi
+# Signal THIS session's watcher to reset terminal and exit
+# Find session ID via ITERM_SESSION_ID or parent TTY
+SESSION_ID="${ITERM_SESSION_ID:-}"
+TTY_MAP="$HOME/.claude/claudetop-iterm-ttys"
+if [ -z "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
+  PARENT_TTY=$(ps -p $PPID -o tty= 2>/dev/null | tr -d ' ')
+  if [ -n "$PARENT_TTY" ] && [ "$PARENT_TTY" != "??" ]; then
+    SESSION_ID=$(grep "=/dev/${PARENT_TTY}$" "$TTY_MAP" 2>/dev/null | head -1 | cut -d= -f1)
   fi
-
-  # Reset the specific TTY if we found the session
-  _reset_tty() {
-    local tty="$1" sid="$2"
-    [ -n "$tty" ] && [ -w "$tty" ] || return
-    printf "\033]1337;SetColors=bg=default\007" > "$tty"
-    printf "\033]1;\007" > "$tty"
-    printf "\033]1337;SetBadgeFormat=\007" > "$tty"
-    # Mark state file as stale so watcher stops
-    [ -n "$sid" ] && echo "timestamp=0" > "$HOME/.claude/claudetop-iterm-state.${sid}"
-  }
-
-  if [ -n "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
-    MY_TTY=$(grep "^${SESSION_ID}=" "$TTY_MAP" 2>/dev/null | tail -1 | cut -d= -f2-)
-    _reset_tty "$MY_TTY" "$SESSION_ID"
-  else
-    # Fallback: reset ALL mapped TTYs (session is ending, be thorough)
-    if [ -f "$TTY_MAP" ]; then
-      while IFS='=' read -r sid tty; do
-        _reset_tty "$tty" "$sid"
-      done < "$TTY_MAP"
-    fi
-  fi
+fi
+if [ -n "$SESSION_ID" ]; then
+  sf="$HOME/.claude/claudetop-iterm-state.${SESSION_ID}"
+  [ -f "$sf" ] && {
+    echo "iterm_session=${SESSION_ID}"
+    echo "timestamp=$(date +%s)"
+    echo "status=ended"
+    echo "bgcolor=default"
+    echo "modes=all"
+  } > "$sf"
 fi

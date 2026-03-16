@@ -47,7 +47,7 @@ while true; do
     # Read state
     TIMESTAMP="" PROJECT="" MODEL="" COST="" VELOCITY="" CTX="" CACHE=""
     DURATION="" TOKENS_IN="" TOKENS_OUT="" LINES_ADDED="" LINES_REMOVED=""
-    TAG="" BGCOLOR="" MODES="" ITERM_SESSION=""
+    TAG="" BGCOLOR="" MODES="" ITERM_SESSION="" STATUS=""
     while IFS='=' read -r key value; do
       case "$key" in
         timestamp)      TIMESTAMP="$value" ;;
@@ -66,8 +66,20 @@ while true; do
         bgcolor)        BGCOLOR="$value" ;;
         modes)          MODES="$value" ;;
         iterm_session)  ITERM_SESSION="$value" ;;
+        status)         STATUS="$value" ;;
       esac
     done < "$STATE_FILE"
+
+    # Session ended — reset terminal and exit
+    if [ "$STATUS" = "ended" ]; then
+      if [ -w "$MY_TTY" ]; then
+        printf "\033]1337;SetColors=bg=default\007" > "$MY_TTY"
+        printf "\033]1;\007" > "$MY_TTY"
+        printf "\033]1337;SetBadgeFormat=\007" > "$MY_TTY"
+      fi
+      rm -f "$STATE_FILE"
+      exit 0
+    fi
 
     # Only apply for the matching pane
     if [ "$ITERM_SESSION" != "$MY_SESSION" ]; then
@@ -129,7 +141,11 @@ while true; do
     # Background color (only on change)
     if _w "bgcolor" && [ -n "$BGCOLOR" ]; then
       if [ "$BGCOLOR" = "default" ]; then
+        # Full reset — bgcolor, title, badge
         printf "\033]1337;SetColors=bg=default\007" > "$MY_TTY"
+        printf "\033]1;\007" > "$MY_TTY"
+        printf "\033]1337;SetBadgeFormat=\007" > "$MY_TTY"
+        CACHED_TITLE=""
       else
         printf "\033]1337;SetColors=bg=%s\007" "$BGCOLOR" > "$MY_TTY"
       fi
