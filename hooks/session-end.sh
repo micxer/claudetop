@@ -37,3 +37,29 @@ jq -c \
     tag:             $tag,
     branch:          $branch
   }' <<< "$JSON" >> "$HISTORY_FILE"
+
+# Update iTerm2 state to "session ended" — green tint, title shows "idle"
+if [ -n "${CLAUDETOP_ITERM:-}" ]; then
+  ITERM_STATE_FILE="$HOME/.claude/claudetop-iterm-state.${ITERM_SESSION_ID:-default}"
+  PROJECT_NAME=$(echo "$JSON" | jq -r '((.workspace.project_dir // .cwd // "") | split("/") | last)')
+  COST_USD=$(echo "$JSON" | jq -r '.cost.total_cost_usd // 0')
+  PLAIN_COST=$(printf "$%.2f" "$COST_USD")
+  MODEL=$(echo "$JSON" | jq -r '.model.display_name // "unknown"')
+  {
+    echo "iterm_session=${ITERM_SESSION_ID:-}"
+    echo "timestamp=$(date +%s)"
+    echo "project=${PROJECT_NAME}"
+    echo "model=${MODEL}"
+    echo "cost=${PLAIN_COST}"
+    echo "velocity="
+    echo "ctx=0"
+    echo "cache=0"
+    echo "duration=done"
+    echo "tokens_in=0"
+    echo "tokens_out=0"
+    echo "lines_added=0"
+    echo "lines_removed=0"
+    echo "bgcolor=152b17"
+    echo "modes=${CLAUDETOP_ITERM}"
+  } > "$ITERM_STATE_FILE"
+fi

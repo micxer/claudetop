@@ -9,6 +9,13 @@
 #   CLAUDETOP_THEME          compact|minimal|full (default: full)
 #   CLAUDETOP_DAILY_BUDGET   daily budget in USD (e.g., 50)
 #   CLAUDETOP_TAG            tag for session tracking (e.g., "auth-refactor")
+#   CLAUDETOP_ITERM          iTerm2 integration (default: off)
+#                            title     — set tab/window title with cost & model
+#                            statusbar — set user variables for iTerm2 status bar
+#                            badge     — show watermark overlay with key metrics
+#                            bgcolor   — tint terminal background by session state
+#                            all       — enable all four
+#                            Comma-separated: "title,badge,bgcolor"
 #
 # Plugin system: drop executable scripts into ~/.claude/claudetop.d/
 # Each plugin receives the session JSON on stdin and outputs a single
@@ -17,6 +24,7 @@
 set -euo pipefail
 
 THEME="${CLAUDETOP_THEME:-full}"
+ITERM_MODE="${CLAUDETOP_ITERM:-}"
 HISTORY_FILE="${HOME}/.claude/claudetop-history.jsonl"
 
 # Read JSON from stdin
@@ -543,4 +551,81 @@ else
   if [ -n "$LINE5" ]; then
     printf "%b\n" "$LINE5"
   fi
+fi
+
+# =============================================
+# iTerm2 Integration
+# =============================================
+# Writes iTerm2 state to ~/.claude/claudetop-iterm-state. A shell prompt hook
+# (PROMPT_COMMAND / precmd) reads this file and emits the escape sequences.
+# This two-step approach is needed because Claude Code's status line script
+# doesn't have direct terminal access (/dev/tty unavailable in sandbox).
+#
+# The prompt hook is installed by `install.sh` or can be added manually:
+#   source ~/.claude/claudetop-iterm-hook.sh
+
+if [ -n "$ITERM_MODE" ]; then
+  # Per-session state file so multiple Claude Code sessions don't clobber each other
+  ITERM_STATE_FILE="${HOME}/.claude/claudetop-iterm-state.${ITERM_SESSION_ID:-default}"
+  ITERM_WATCHER="${HOME}/.claude/claudetop-iterm-watcher.sh"
+
+  iterm_wants() {
+    [ "$ITERM_MODE" = "all" ] && return 0
+    case ",$ITERM_MODE," in *",$1,"*) return 0 ;; esac
+    return 1
+  }
+
+  # Discover TTY from parent process tree and register it
+  # (status line script can't call `tty` but can find the TTY via the parent shell)
+  ITERM_TTY_MAP="${HOME}/.claude/claudetop-iterm-ttys"
+  if [ -n "${ITERM_SESSION_ID:-}" ]; then
+    _PARENT_TTY=$(ps -p $PPID -o tty= 2>/dev/null | tr -d ' ')
+    if [ -n "$_PARENT_TTY" ] && [ "$_PARENT_TTY" != "??" ]; then
+      _PARENT_TTY="/dev/${_PARENT_TTY}"
+      # Write/update TTY mapping
+      grep -v "^${ITERM_SESSION_ID}=" "$ITERM_TTY_MAP" 2>/dev/null > "${ITERM_TTY_MAP}.tmp" || true
+      echo "${ITERM_SESSION_ID}=${_PARENT_TTY}" >> "${ITERM_TTY_MAP}.tmp"
+      mv "${ITERM_TTY_MAP}.tmp" "$ITERM_TTY_MAP"
+    fi
+  fi
+
+  # Auto-launch watcher if not already running for this iTerm session
+  if [ -n "${ITERM_SESSION_ID:-}" ] && [ -x "$ITERM_WATCHER" ]; then
+    if ! pgrep -f "claudetop-iterm-watcher.sh ${ITERM_SESSION_ID}" >/dev/null 2>&1; then
+      nohup "$ITERM_WATCHER" "$ITERM_SESSION_ID" >/dev/null 2>&1 &
+    fi
+  fi
+
+  # Plain-text versions (no ANSI) for iTerm2 chrome
+  PLAIN_COST=$(printf "$%s" "$(echo "scale=2; $COST / 1" | bc)")
+  PLAIN_VELOCITY=""
+  if [ -n "$VELOCITY" ] && [ "$(echo "$RATE > 0" | bc)" -eq 1 ]; then
+    PLAIN_VELOCITY="\$${RATE}/hr"
+  fi
+
+  # Read existing bgcolor BEFORE overwriting (hooks set green/black between renders)
+  EXISTING_BG=""
+  if iterm_wants "bgcolor"; then
+    EXISTING_BG=$(grep "^bgcolor=" "$ITERM_STATE_FILE" 2>/dev/null | cut -d= -f2)
+  fi
+
+  # Build state file — one key=value per line, read by the watcher
+  {
+    echo "iterm_session=${ITERM_SESSION_ID:-}"
+    echo "timestamp=$(date +%s)"
+    echo "project=${PROJECT_NAME}"
+    echo "model=${MODEL_NAME}"
+    echo "cost=${PLAIN_COST}"
+    echo "velocity=${PLAIN_VELOCITY}"
+    echo "ctx=${CTX_USED}"
+    echo "cache=${CACHE_PCT}"
+    echo "duration=${DUR_FMT}"
+    echo "tokens_in=${IN_FMT}"
+    echo "tokens_out=${OUT_FMT}"
+    echo "lines_added=${LINES_ADDED}"
+    echo "lines_removed=${LINES_REMOVED}"
+    [ -n "${CLAUDETOP_TAG:-}" ] && echo "tag=${CLAUDETOP_TAG}"
+    echo "bgcolor=${EXISTING_BG:-000000}"
+    echo "modes=${ITERM_MODE}"
+  } > "$ITERM_STATE_FILE"
 fi

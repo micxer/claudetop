@@ -165,6 +165,52 @@ export CLAUDETOP_THEME=minimal   # 2 lines
 export CLAUDETOP_THEME=compact   # 1 line
 ```
 
+### iTerm2 integration
+
+Push claudetop data into iTerm2's chrome — tab titles, status bar, and badge watermark:
+
+```bash
+export CLAUDETOP_ITERM=all           # Enable everything
+export CLAUDETOP_ITERM=title         # Tab/window title only
+export CLAUDETOP_ITERM=badge         # Watermark overlay only
+export CLAUDETOP_ITERM=statusbar     # User variables for status bar
+export CLAUDETOP_ITERM=bgcolor       # Background color tint by state
+export CLAUDETOP_ITERM=title,badge   # Combine any options
+```
+
+**Tab title** — Shows `project | $4.21 | Opus 4.6 | ctx:38%` in your iTerm2 tab. Zero configuration.
+
+**Badge** — Faint watermark in the terminal background with cost, model, and context at a glance. Great for keeping cost visible while scrolling through output.
+
+**Background color** — Subtly tints the terminal background based on session state:
+
+| Tint | Meaning |
+|------|---------|
+| Green | Healthy session (low context, under $5) or session ended (idle/waiting) |
+| Amber | Caution — cost milestone, compact soon, low cache, spinning |
+| Red | Alert — over budget, burn rate spike, $25 mark |
+| Default | Normal — no special state, uses your profile's background |
+
+When a session ends, the background stays green so you can see at a glance which terminals are idle vs active. Resets to default when the next session starts clean.
+
+**Status bar** — Sets iTerm2 user-defined variables that you can display in the status bar (top or bottom of terminal). Configure in iTerm2: Preferences > Profiles > Session > Status Bar > add "Interpolated String" components:
+
+| Variable | Content | Example |
+|----------|---------|---------|
+| `\(user.claudetop_cost)` | Session cost | `$4.21` |
+| `\(user.claudetop_model)` | Current model | `Opus 4.6` |
+| `\(user.claudetop_ctx)` | Context usage | `38%` |
+| `\(user.claudetop_project)` | Project name | `my-project` |
+| `\(user.claudetop_duration)` | Session time | `20m 0s` |
+| `\(user.claudetop_cache)` | Cache hit ratio | `66%` |
+| `\(user.claudetop_velocity)` | Burn rate | `$5.10/hr` |
+| `\(user.claudetop_tokens_in)` | Input tokens | `152.3K` |
+| `\(user.claudetop_tokens_out)` | Output tokens | `45.2K` |
+| `\(user.claudetop_lines)` | Lines changed | `+256/-43` |
+| `\(user.claudetop_tag)` | Session tag | `#auth-refactor` |
+
+No-op on non-iTerm2 terminals — escape sequences are silently ignored.
+
 ### Context composition
 
 See what's eating your context window:

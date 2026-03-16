@@ -92,7 +92,36 @@ else
   echo '    "hooks": { "SessionEnd": [{"matcher":"","hooks":[{"type":"command","command":"~/.claude/hooks/claudetop-session-end.sh"}]}] }'
 fi
 
-# 8. Copy pricing updater + fetch initial pricing
+# 8. Install iTerm2 prompt hook
+ITERM_HOOK_SRC="$SCRIPT_DIR/claudetop-iterm-hook.sh"
+ITERM_HOOK_DEST="$HOME/.claude/claudetop-iterm-hook.sh"
+if [ -f "$ITERM_HOOK_SRC" ]; then
+  cp "$ITERM_HOOK_SRC" "$ITERM_HOOK_DEST"
+  chmod +x "$ITERM_HOOK_DEST"
+  echo "  Installed iTerm2 hook -> $ITERM_HOOK_DEST"
+
+  # Auto-source in shell profile if CLAUDETOP_ITERM is set
+  SOURCE_LINE="[ -n \"\${CLAUDETOP_ITERM:-}\" ] && source \"$ITERM_HOOK_DEST\""
+  SHELL_RC=""
+  if [ -n "${ZSH_VERSION:-}" ] || [ -f "$HOME/.zshrc" ]; then
+    SHELL_RC="$HOME/.zshrc"
+  elif [ -f "$HOME/.bash_profile" ]; then
+    SHELL_RC="$HOME/.bash_profile"
+  elif [ -f "$HOME/.bashrc" ]; then
+    SHELL_RC="$HOME/.bashrc"
+  fi
+
+  if [ -n "$SHELL_RC" ] && ! grep -q "claudetop-iterm-hook" "$SHELL_RC" 2>/dev/null; then
+    echo "" >> "$SHELL_RC"
+    echo "# claudetop iTerm2 integration (tab title, badge, background color)" >> "$SHELL_RC"
+    echo "$SOURCE_LINE" >> "$SHELL_RC"
+    echo "  Added iTerm2 hook to $SHELL_RC"
+  else
+    echo "  iTerm2 hook already in shell profile (skipped)"
+  fi
+fi
+
+# 10. Copy pricing updater + fetch initial pricing
 UPDATER_DEST="$HOME/.claude/update-claudetop-pricing.sh"
 cp "$SCRIPT_DIR/update-pricing.sh" "$UPDATER_DEST"
 chmod +x "$UPDATER_DEST"
@@ -102,7 +131,7 @@ echo "  Installed pricing updater + initial pricing"
 # Try to fetch latest pricing now
 "$UPDATER_DEST" 2>/dev/null || true
 
-# 9. Set up daily pricing update (cron job at 6am)
+# 11. Set up daily pricing update (cron job at 6am)
 CRON_CMD="0 6 * * * $UPDATER_DEST >/dev/null 2>&1"
 if ! crontab -l 2>/dev/null | grep -q "update-claudetop-pricing"; then
   (crontab -l 2>/dev/null || true; echo "$CRON_CMD") | crontab -
@@ -118,6 +147,7 @@ echo "Optional config (add to env or ~/.bashrc):"
 echo "  export CLAUDETOP_DAILY_BUDGET=50    # Daily budget alert"
 echo "  export CLAUDETOP_THEME=minimal      # compact|minimal|full"
 echo "  export CLAUDETOP_TAG=my-feature     # Tag sessions for tracking"
+echo "  export CLAUDETOP_ITERM=all          # iTerm2: title + badge + bgcolor + statusbar"
 echo ""
 echo "View analytics:"
 echo "  claudetop-stats          # Today"
