@@ -20,6 +20,7 @@ MY_TTY=""
 # Cached state for re-applying title
 CACHED_TITLE=""
 CACHED_STALE=1
+IDLE_STREAK=0          # consecutive cycles with no descendants — debounce green
 
 get_tty() {
   [ -f "$TTY_MAP" ] || return 1
@@ -43,6 +44,7 @@ while true; do
   CUR_MTIME=$(stat -f %m "$STATE_FILE" 2>/dev/null || stat -c %Y "$STATE_FILE" 2>/dev/null) || continue
   if [ "$CUR_MTIME" != "$LAST_MTIME" ]; then
     LAST_MTIME="$CUR_MTIME"
+    IDLE_STREAK=0
 
     # Read state
     TIMESTAMP="" PROJECT="" MODEL="" COST="" VELOCITY="" CTX="" CACHE=""
@@ -158,13 +160,30 @@ while true; do
     fi
 
     # If state file hasn't changed for 3+ seconds and bgcolor is black,
-    # Claude is likely paused (permission prompt). Switch to green.
+    # Claude may be idle (permission prompt, waiting for input). Switch to green.
+    # Check: sum CPU across all processes on this TTY. During thinking/streaming/
+    # tool execution, the claude process or its tools will be using CPU.
+    # MCP servers and caffeinate sit at 0% when idle so they don't interfere.
+    # Requires 6 consecutive idle cycles (~3s) to debounce brief gaps.
     if [ "$CACHED_STALE" -eq 0 ] && [ -n "$LAST_MTIME" ] && [ -w "$MY_TTY" ]; then
       IDLE_NOW=$(date +%s)
       FILE_AGE=$((IDLE_NOW - LAST_MTIME))
       if [ "$FILE_AGE" -ge 3 ] && [ "${BGCOLOR:-}" = "000000" ]; then
-        printf "\033]1337;SetColors=bg=152b17\007" > "$MY_TTY"
-        BGCOLOR="152b17"
+        _TTY_SHORT="${MY_TTY#/dev/}"
+        # Sum CPU of all processes on this TTY (excludes login/bash shell noise)
+        _TTY_CPU=$(ps -eo tty,%cpu,comm 2>/dev/null | awk -v t="$_TTY_SHORT" '$1 == t && $3 !~ /^(login|-?bash|zsh)$/ {s+=$2} END {printf "%.1f", s+0}')
+        if [ "$(printf '%s > 1.0\n' "${_TTY_CPU:-0}" | bc 2>/dev/null)" -eq 1 ]; then
+          IDLE_STREAK=0
+        else
+          IDLE_STREAK=$((IDLE_STREAK + 1))
+          # Only go green after 6 consecutive idle cycles (~3s debounce)
+          if [ "$IDLE_STREAK" -ge 6 ]; then
+            printf "\033]1337;SetColors=bg=152b17\007" > "$MY_TTY"
+            BGCOLOR="152b17"
+          fi
+        fi
+      else
+        IDLE_STREAK=0
       fi
     fi
   fi
