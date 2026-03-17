@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.claude/claudetop.sh"
 PLUGIN_DIR="$HOME/.claude/claudetop.d"
 SETTINGS="$HOME/.claude/settings.json"
-STATS_DEST="/usr/local/bin/claudetop-stats"
+STATS_DEST="$HOME/.local/bin/claudetop-stats"
 
 echo "Installing claudetop..."
 
@@ -35,17 +35,11 @@ for f in "$SCRIPT_DIR/plugins/examples/"*.sh; do
 done
 echo "  Copied example plugins to $PLUGIN_DIR/_examples/"
 
-# 5. Install claudetop-stats CLI
-if [ -w "$(dirname "$STATS_DEST")" ]; then
-  cp "$SCRIPT_DIR/claudetop-stats" "$STATS_DEST"
-  chmod +x "$STATS_DEST"
-  echo "  Installed claudetop-stats -> $STATS_DEST"
-else
-  echo "  Installing claudetop-stats (requires sudo)..."
-  sudo cp "$SCRIPT_DIR/claudetop-stats" "$STATS_DEST"
-  sudo chmod +x "$STATS_DEST"
-  echo "  Installed claudetop-stats -> $STATS_DEST"
-fi
+# 5. Install claudetop-stats CLI (user-local, no sudo needed)
+mkdir -p "$(dirname "$STATS_DEST")"
+cp "$SCRIPT_DIR/claudetop-stats" "$STATS_DEST"
+chmod +x "$STATS_DEST"
+echo "  Installed claudetop-stats -> $STATS_DEST"
 
 # 6. Copy SessionEnd hook
 HOOK_SRC="$SCRIPT_DIR/hooks/session-end.sh"
@@ -121,7 +115,7 @@ if [ -f "$ITERM_HOOK_SRC" ]; then
   fi
 fi
 
-# 10. Copy pricing updater + fetch initial pricing
+# 9. Copy pricing updater + fetch initial pricing
 UPDATER_DEST="$HOME/.claude/update-claudetop-pricing.sh"
 cp "$SCRIPT_DIR/update-pricing.sh" "$UPDATER_DEST"
 chmod +x "$UPDATER_DEST"
@@ -131,18 +125,17 @@ echo "  Installed pricing updater + initial pricing"
 # Try to fetch latest pricing now
 "$UPDATER_DEST" 2>/dev/null || true
 
-# 11. Set up daily pricing update (cron job at 6am)
-CRON_CMD="0 6 * * * $UPDATER_DEST >/dev/null 2>&1"
-if ! crontab -l 2>/dev/null | grep -q "update-claudetop-pricing"; then
-  (crontab -l 2>/dev/null || true; echo "$CRON_CMD") | crontab -
-  echo "  Added daily pricing update cron (6am)"
-else
-  echo "  Daily pricing cron already configured (skipped)"
-fi
-
 echo ""
 echo "Done! Restart Claude Code to activate claudetop."
 echo ""
+
+# Check if ~/.local/bin is in PATH
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+  echo "NOTE: Add ~/.local/bin to your PATH for the claudetop-stats command:"
+  echo '  export PATH="$HOME/.local/bin:$PATH"'
+  echo ""
+fi
+
 echo "Optional config (add to env or ~/.bashrc):"
 echo "  export CLAUDETOP_DAILY_BUDGET=50    # Daily budget alert"
 echo "  export CLAUDETOP_THEME=minimal      # compact|minimal|full"
