@@ -128,15 +128,6 @@ RED="\033[31m"
 WHITE="\033[37m"
 GRAY="\033[90m"
 
-# --- Time of day ---
-TIME_NOW=$(date +"%H:%M")
-HOUR=$(date +"%H")
-if [ "$HOUR" -ge 22 ] || [ "$HOUR" -lt 6 ]; then
-  TIME_FMT="${MAGENTA}${TIME_NOW}${RESET}"
-else
-  TIME_FMT="${DIM}${TIME_NOW}${RESET}"
-fi
-
 # --- Session tag ---
 TAG_FMT=""
 if [ -n "${CLAUDETOP_TAG:-}" ]; then
@@ -441,7 +432,6 @@ done
 
 if [ "$THEME" = "compact" ]; then
   # --- COMPACT: 1 line ---
-  printf "%b " "$TIME_FMT"
   printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
   printf "  ${CYAN}%s${RESET}" "$MODEL_NAME"
   printf "  ${GREEN}%s${RESET}" "$ACTUAL_COST_FMT"
@@ -459,7 +449,6 @@ if [ "$THEME" = "compact" ]; then
 elif [ "$THEME" = "minimal" ]; then
   # --- MINIMAL: 2 lines ---
   # Line 1: project + model + duration + lines
-  printf "%b  " "$TIME_FMT"
   printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
   if [ -n "$REL_PATH" ]; then
     printf "${DIM}%s${RESET}" "$REL_PATH"
@@ -491,8 +480,7 @@ elif [ "$THEME" = "minimal" ]; then
 else
   # --- FULL: 3-5 lines (default) ---
 
-  # Line 1: Time + Project + folder + model + duration + line delta + tag
-  printf "%b  " "$TIME_FMT"
+  # Line 1: Project + folder + model + duration + line delta + tag
   printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
   if [ -n "$REL_PATH" ]; then
     printf "${DIM}%s${RESET}" "$REL_PATH"
