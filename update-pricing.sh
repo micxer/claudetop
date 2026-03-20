@@ -15,7 +15,7 @@ set -euo pipefail
 
 CACHE_DIR="$HOME/.claude"
 PRICING_FILE="$CACHE_DIR/claudetop-pricing.json"
-REPO_URL="https://raw.githubusercontent.com/liorwn/claudetop/main/pricing.json"
+REPO_URL="https://raw.githubusercontent.com/micxer/claudetop/main/pricing.json"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$CACHE_DIR"
