@@ -42,9 +42,15 @@ if RESPONSE=$(curl -sf --max-time 5 "$REPO_URL" 2>/dev/null); then
   fi
 fi
 
-# Source 2: Try Anthropic API docs (future enhancement)
-# Anthropic doesn't have a pricing API yet. If they add one, plug it in here.
-# For now, the GitHub source is the primary path. Community PRs keep it current.
+# Source 2: Try claudetop-engine (scrapes Anthropic docs directly)
+ENGINE="$(dirname "$0")/claudetop-engine"
+[ ! -f "$ENGINE" ] && ENGINE="$(command -v claudetop-engine 2>/dev/null || true)"
+if [ -z "$FETCHED" ] && [ -n "$ENGINE" ] && [ -f "$ENGINE" ]; then
+  if python3 "$ENGINE" update-pricing 2>/dev/null; then
+    echo "  Updated via engine (Anthropic docs scrape)"
+    exit 0
+  fi
+fi
 
 # Source 3: Fall back to bundled pricing.json from install
 if [ -z "$FETCHED" ] && [ -f "$SCRIPT_DIR/pricing.json" ]; then

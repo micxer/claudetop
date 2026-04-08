@@ -1326,16 +1326,127 @@ def cmd_dashboard(port=8080):
         print("\nDashboard stopped.")
 
 
+# ── Pricing Updater ──────────────────────────────────────────────────────────
+
+def cmd_update_pricing():
+    """Fetch latest pricing from Anthropic docs, fall back to GitHub repo."""
+    import re
+    from urllib.request import urlopen, Request
+    from urllib.error import URLError
+
+    print("Checking Claude model pricing...")
+
+    new_pricing = None
+
+    # Source 1: Scrape Anthropic's official pricing page
+    PRICING_URL = "https://platform.claude.com/docs/en/docs/about-claude/pricing"
+    try:
+        req = Request(PRICING_URL, headers={"User-Agent": "claudetop/1.0"})
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Parse the model pricing table from HTML
+        # Format: Opus 4.6</td><td class="...">$5 / MTok</td><td class="...">$6.25 / MTok</td>...
+        # 5 price cells per row: input, cache_write_5min, cache_write_1hr, cache_read, output
+        TD = r'</td><td[^>]*>\$([0-9.]+)\s*/\s*MTok'
+        models = {}
+        for family, label in [
+            ("opus",   r"Opus 4\.6"),
+            ("sonnet", r"Sonnet 4\.6"),
+            ("haiku",  r"Haiku 4\.5"),
+        ]:
+            pattern = label + TD * 5
+            m = re.search(pattern, html)
+            if m:
+                models[family] = {
+                    "input": float(m.group(1)),
+                    "cache_write_5min": float(m.group(2)),
+                    "cache_write_1hr": float(m.group(3)),
+                    "cache_read": float(m.group(4)),
+                    "output": float(m.group(5)),
+                    "match": family,
+                }
+
+        if len(models) >= 3:
+            new_pricing = {
+                "_updated": date.today().isoformat(),
+                "_source": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+                "_method": "auto-scraped from Anthropic docs",
+                "models": models,
+            }
+            print(f"  Fetched from Anthropic docs (all 3 models found)")
+        else:
+            print(f"  Anthropic docs: only found {len(models)}/3 models, trying GitHub...")
+
+    except (URLError, OSError) as e:
+        print(f"  Anthropic docs unreachable: {e}")
+
+    # Source 2: GitHub repo (community-maintained fallback)
+    if not new_pricing:
+        REPO_URL = "https://raw.githubusercontent.com/liorwn/claudetop/main/pricing.json"
+        try:
+            req = Request(REPO_URL, headers={"User-Agent": "claudetop/1.0"})
+            with urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+            if "models" in data and "opus" in data["models"]:
+                new_pricing = data
+                new_pricing["_method"] = "fetched from GitHub repo"
+                print(f"  Fetched from GitHub repo")
+        except (URLError, OSError, json.JSONDecodeError) as e:
+            print(f"  GitHub repo unreachable: {e}")
+
+    if not new_pricing:
+        print("  Could not fetch pricing from any source. Keeping existing cache.")
+        return
+
+    # Compare with current cached pricing
+    current = {}
+    if PRICING_FILE.exists():
+        try:
+            current = json.loads(PRICING_FILE.read_text())
+        except Exception:
+            pass
+
+    changes = []
+    for family in ("opus", "sonnet", "haiku"):
+        old = current.get("models", {}).get(family, {})
+        new = new_pricing.get("models", {}).get(family, {})
+        for field in ("input", "output", "cache_read"):
+            old_val = old.get(field) or old.get("cache_write_5min" if field == "cache_write" else field, 0)
+            new_val = new.get(field, 0)
+            if old_val and new_val and abs(old_val - new_val) > 0.001:
+                changes.append(f"  {family} {field}: ${old_val} → ${new_val}")
+
+    # Write new pricing
+    PRICING_FILE.write_text(json.dumps(new_pricing, indent=2) + "\n")
+
+    print(f"\n  Saved to {PRICING_FILE}")
+    print(f"\n  Current pricing:")
+    for family in ("opus", "sonnet", "haiku"):
+        m = new_pricing["models"][family]
+        print(f"    {family:<8}  ${m['input']}/MTok in  ${m['output']}/MTok out  "
+              f"${m.get('cache_write_5min', m.get('cache_write', '?'))}/MTok cwrite  "
+              f"${m['cache_read']}/MTok cread")
+
+    if changes:
+        print(f"\n  PRICE CHANGES DETECTED:")
+        for c in changes:
+            print(c)
+    else:
+        print(f"\n  No price changes detected.")
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 USAGE = """
 claudetop-engine — Analytics engine for claudetop
 
 Usage:
-  claudetop-engine scan        Scan JSONL files → ~/.claude/claudetop.db
-  claudetop-engine today       Today's usage summary
-  claudetop-engine stats       All-time statistics
-  claudetop-engine dashboard   Scan + start dashboard at localhost:8080
+  claudetop-engine scan            Scan JSONL files → ~/.claude/claudetop.db
+  claudetop-engine today           Today's usage summary
+  claudetop-engine stats           All-time statistics
+  claudetop-engine dashboard       Scan + start dashboard at localhost:8080
+  claudetop-engine update-pricing  Fetch latest prices from Anthropic docs
 
 Features over basic claudetop-stats:
   • Scans ALL session JSONL files (not just hook-recorded sessions)
@@ -1343,6 +1454,7 @@ Features over basic claudetop-stats:
   • Subagent cost attribution
   • Interactive web dashboard with charts
   • SQLite backend for fast queries
+  • Auto-scrapes Anthropic pricing page for current rates
 """
 
 if __name__ == "__main__":
@@ -1354,6 +1466,8 @@ if __name__ == "__main__":
         cmd_today()
     elif cmd == "stats":
         cmd_stats()
+    elif cmd == "update-pricing":
+        cmd_update_pricing()
     elif cmd == "dashboard":
         port = 8080
         if len(sys.argv) > 2:
