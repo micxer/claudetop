@@ -92,7 +92,28 @@ else
   echo '    "hooks": { "SessionEnd": [{"matcher":"","hooks":[{"type":"command","command":"~/.claude/hooks/claudetop-session-end.sh"}]}] }'
 fi
 
-# 8. Install iTerm2 prompt hook
+# 8. Install claudetop-engine (analytics + dashboard)
+ENGINE_SRC="$SCRIPT_DIR/claudetop-engine"
+ENGINE_DEST="/usr/local/bin/claudetop-engine"
+DASHBOARD_DEST="/usr/local/bin/claudetop-dashboard"
+if [ -f "$ENGINE_SRC" ]; then
+  if [ -w "$(dirname "$ENGINE_DEST")" ]; then
+    cp "$ENGINE_SRC" "$ENGINE_DEST"
+    chmod +x "$ENGINE_DEST"
+    cp "$SCRIPT_DIR/claudetop-dashboard" "$DASHBOARD_DEST"
+    chmod +x "$DASHBOARD_DEST"
+  else
+    echo "  Installing engine + dashboard (requires sudo)..."
+    sudo cp "$ENGINE_SRC" "$ENGINE_DEST"
+    sudo chmod +x "$ENGINE_DEST"
+    sudo cp "$SCRIPT_DIR/claudetop-dashboard" "$DASHBOARD_DEST"
+    sudo chmod +x "$DASHBOARD_DEST"
+  fi
+  echo "  Installed claudetop-engine -> $ENGINE_DEST"
+  echo "  Installed claudetop-dashboard -> $DASHBOARD_DEST"
+fi
+
+# 9. Install iTerm2 prompt hook
 ITERM_HOOK_SRC="$SCRIPT_DIR/claudetop-iterm-hook.sh"
 ITERM_HOOK_DEST="$HOME/.claude/claudetop-iterm-hook.sh"
 if [ -f "$ITERM_HOOK_SRC" ]; then
@@ -150,11 +171,15 @@ echo "  export CLAUDETOP_TAG=my-feature     # Tag sessions for tracking"
 echo "  export CLAUDETOP_ITERM=all          # iTerm2: title + badge + bgcolor + statusbar"
 echo ""
 echo "View analytics:"
-echo "  claudetop-stats          # Today"
+echo "  claudetop-stats          # Today (from hook history)"
 echo "  claudetop-stats week     # This week"
-echo "  claudetop-stats month    # This month"
 echo "  claudetop-stats all      # All time"
-echo "  claudetop-stats tag X    # Filter by tag"
+echo ""
+echo "Deep analytics (scans ALL session files, per-turn, subagents):"
+echo "  claudetop-engine scan    # Scan all JSONL -> SQLite"
+echo "  claudetop-engine today   # Today from SQLite"
+echo "  claudetop-engine stats   # All-time deep stats"
+echo "  claudetop-dashboard      # Live web dashboard at localhost:8080"
 echo ""
 echo "Enable more plugins:"
 echo "  cp $PLUGIN_DIR/_examples/spotify.sh $PLUGIN_DIR/"

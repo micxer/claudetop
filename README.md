@@ -138,6 +138,21 @@ Top projects by cost
   the-table              $10.00  (3 sessions)
 ```
 
+### Deep analytics engine
+
+The analytics engine scans **all** Claude Code JSONL session files — not just hook-recorded ones. It captures your complete history including sessions from before claudetop was installed, subagent costs, and per-turn token breakdowns.
+
+```bash
+claudetop-engine scan       # Scan all JSONL files → SQLite
+claudetop-engine today      # Today (with per-turn tool breakdown)
+claudetop-engine stats      # All-time (subagents, top tools, projects)
+claudetop-engine dashboard  # Live web dashboard at localhost:8080
+```
+
+The live dashboard features an activity heatmap, cost-by-model charts, project and tool breakdowns, subagent cost attribution, and a sortable session table — all with model filtering and time range selection. Auto-refreshes every 30 seconds.
+
+Zero dependencies — uses only Python 3 standard library (`sqlite3`, `http.server`, `json`).
+
 ### Session tagging
 
 Track costs per feature, bug, or initiative:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # claudetop-stats — analytics for Claude Code session history
-# Reads ~/.claude/claudetop-history.jsonl
+# Reads ~/.claude/claudetop-history.jsonl (legacy) or ~/.claude/claudetop.db (engine)
 #
 # Usage:
 #   claudetop-stats              # Today's summary
@@ -14,10 +14,38 @@
 #   claudetop-stats pr           # Alias for branch
 #   claudetop-stats export csv   # Export all history as CSV
 #   claudetop-stats export json  # Export all history as JSON
+#   claudetop-stats scan         # Scan ALL JSONL files into SQLite (via engine)
+#   claudetop-stats deep         # Rich stats from SQLite (per-turn, subagents)
 
 set -euo pipefail
 
 HISTORY_FILE="$HOME/.claude/claudetop-history.jsonl"
+
+# ── Engine delegation ─────────────────────────────────────────────────────────
+# If 'scan' or 'deep' is requested, delegate to claudetop-engine
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="${SCRIPT_DIR}/claudetop-engine"
+[ ! -f "$ENGINE" ] && ENGINE="$(command -v claudetop-engine 2>/dev/null || true)"
+
+case "${1:-}" in
+  scan)
+    if [ -n "$ENGINE" ] && [ -f "$ENGINE" ]; then
+      exec python3 "$ENGINE" scan
+    else
+      echo "Error: claudetop-engine not found. Run install.sh first." >&2
+      exit 1
+    fi
+    ;;
+  deep)
+    if [ -n "$ENGINE" ] && [ -f "$ENGINE" ]; then
+      exec python3 "$ENGINE" stats
+    else
+      echo "Error: claudetop-engine not found. Run install.sh first." >&2
+      exit 1
+    fi
+    ;;
+esac
 
 # ANSI colors
 BOLD=$'\033[1m'

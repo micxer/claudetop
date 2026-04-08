@@ -1,0 +1,1367 @@
+#!/usr/bin/env python3
+"""
+claudetop-engine — Analytics engine for claudetop.
+
+Scans Claude Code JSONL session transcripts, stores per-turn data in SQLite,
+and serves an interactive web dashboard. Zero external dependencies.
+
+Commands:
+  scan        Scan JSONL files and update ~/.claude/claudetop.db
+  today       Show today's usage summary
+  stats       Show all-time statistics
+  dashboard   Scan + start live dashboard at http://localhost:8080
+
+https://github.com/liorwn/claudetop
+"""
+
+import json
+import os
+import glob
+import sqlite3
+import sys
+import threading
+import time
+import webbrowser
+from pathlib import Path
+from datetime import datetime, timezone, timedelta, date
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
+from urllib.parse import urlparse, parse_qs
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+DB_PATH = Path.home() / ".claude" / "claudetop.db"
+HISTORY_FILE = Path.home() / ".claude" / "claudetop-history.jsonl"
+PRICING_FILE = Path.home() / ".claude" / "claudetop-pricing.json"
+
+# Fallback pricing (Claude 4.6, April 2026)
+DEFAULT_PRICING = {
+    "opus":   {"input": 5.00, "cache_write": 6.25, "cache_read": 0.50, "output": 25.00},
+    "sonnet": {"input": 3.00, "cache_write": 3.75, "cache_read": 0.30, "output": 15.00},
+    "haiku":  {"input": 1.00, "cache_write": 1.25, "cache_read": 0.10, "output":  5.00},
+}
+
+
+def load_pricing():
+    """Load pricing from claudetop-pricing.json or use defaults."""
+    if PRICING_FILE.exists():
+        try:
+            data = json.loads(PRICING_FILE.read_text())
+            models = data.get("models", {})
+            result = {}
+            for family in ("opus", "sonnet", "haiku"):
+                m = models.get(family, {})
+                result[family] = {
+                    "input": m.get("input", DEFAULT_PRICING[family]["input"]),
+                    "cache_write": m.get("cache_write_5min", m.get("cache_write", DEFAULT_PRICING[family]["cache_write"])),
+                    "cache_read": m.get("cache_read", DEFAULT_PRICING[family]["cache_read"]),
+                    "output": m.get("output", DEFAULT_PRICING[family]["output"]),
+                }
+            return result
+        except Exception:
+            pass
+    return DEFAULT_PRICING
+
+
+PRICING = load_pricing()
+
+
+def model_family(model_id):
+    if not model_id:
+        return None
+    model_id = model_id.lower()
+    if "opus" in model_id:
+        return "opus"
+    if "sonnet" in model_id:
+        return "sonnet"
+    if "haiku" in model_id:
+        return "haiku"
+    return None
+
+
+def calc_cost(model, inp, out, cache_read, cache_creation):
+    family = model_family(model)
+    if not family:
+        family = "sonnet"  # default to sonnet pricing
+    p = PRICING[family]
+    return (
+        inp * p["input"] / 1_000_000
+        + out * p["output"] / 1_000_000
+        + cache_read * p["cache_read"] / 1_000_000
+        + cache_creation * p["cache_write"] / 1_000_000
+    )
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def fmt_cost(c):
+    if c >= 1:
+        return f"${c:.2f}"
+    return f"${c:.3f}"
+
+
+# ── Database ─────────────────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id        TEXT PRIMARY KEY,
+            project_name      TEXT,
+            project_dir       TEXT,
+            first_timestamp   TEXT,
+            last_timestamp    TEXT,
+            git_branch        TEXT,
+            total_input       INTEGER DEFAULT 0,
+            total_output      INTEGER DEFAULT 0,
+            total_cache_read  INTEGER DEFAULT 0,
+            total_cache_write INTEGER DEFAULT 0,
+            model             TEXT,
+            turn_count        INTEGER DEFAULT 0,
+            is_subagent       INTEGER DEFAULT 0,
+            parent_session_id TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS turns (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id        TEXT,
+            timestamp         TEXT,
+            model             TEXT,
+            input_tokens      INTEGER DEFAULT 0,
+            output_tokens     INTEGER DEFAULT 0,
+            cache_read        INTEGER DEFAULT 0,
+            cache_write       INTEGER DEFAULT 0,
+            tool_name         TEXT,
+            cwd               TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_files (
+            path   TEXT PRIMARY KEY,
+            mtime  REAL,
+            lines  INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+        CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sessions_subagent ON sessions(is_subagent);
+    """)
+    conn.commit()
+
+
+# ── Scanner ──────────────────────────────────────────────────────────────────
+
+def project_name_from_path(filepath, cwd=None):
+    """Derive project name from file path or cwd."""
+    if cwd:
+        parts = cwd.replace("\\", "/").rstrip("/").split("/")
+        if len(parts) >= 1:
+            return parts[-1]
+    # Fall back to JSONL file path structure
+    # ~/.claude/projects/-Users-Lior-myproject/session.jsonl → myproject
+    rel = str(filepath).replace(str(PROJECTS_DIR) + "/", "")
+    folder = rel.split("/")[0]
+    # Decode dashed path: -Users-Lior-myproject → myproject
+    parts = folder.split("-")
+    if len(parts) > 1:
+        return parts[-1]
+    return folder
+
+
+def detect_subagent(filepath):
+    """Check if a JSONL file is from a subagent. Returns (is_subagent, parent_session_id)."""
+    path_str = str(filepath)
+    if "/subagents/" in path_str:
+        # Path pattern: .../SESSION_ID/subagents/agent-XXXXX.jsonl
+        parts = path_str.split("/subagents/")
+        if parts:
+            parent_dir = parts[0].split("/")[-1]
+            return True, parent_dir
+    return False, None
+
+
+def parse_jsonl_file(filepath):
+    """Parse a JSONL file, yield session metadata and turns."""
+    turns = []
+    session_meta = {}
+    is_sub, parent_id = detect_subagent(filepath)
+
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                rtype = record.get("type")
+                if rtype not in ("assistant", "user"):
+                    continue
+
+                session_id = record.get("sessionId")
+                if not session_id:
+                    continue
+
+                timestamp = record.get("timestamp", "")
+                cwd = record.get("cwd", "")
+                git_branch = record.get("gitBranch", "")
+
+                if session_id not in session_meta:
+                    session_meta[session_id] = {
+                        "session_id": session_id,
+                        "project_name": project_name_from_path(filepath, cwd),
+                        "project_dir": cwd,
+                        "first_timestamp": timestamp,
+                        "last_timestamp": timestamp,
+                        "git_branch": git_branch,
+                        "model": None,
+                        "is_subagent": 1 if is_sub else 0,
+                        "parent_session_id": parent_id,
+                    }
+                else:
+                    meta = session_meta[session_id]
+                    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
+                        meta["first_timestamp"] = timestamp
+                    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
+                        meta["last_timestamp"] = timestamp
+                    if git_branch and not meta["git_branch"]:
+                        meta["git_branch"] = git_branch
+                    if cwd and (not meta["project_dir"] or len(cwd) > len(meta["project_dir"])):
+                        meta["project_dir"] = cwd
+
+                if rtype == "assistant":
+                    msg = record.get("message", {})
+                    usage = msg.get("usage", {})
+                    model = msg.get("model", "")
+
+                    input_tokens = usage.get("input_tokens", 0) or 0
+                    output_tokens = usage.get("output_tokens", 0) or 0
+                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+
+                    if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                        continue
+
+                    tool_name = None
+                    for item in msg.get("content", []):
+                        if isinstance(item, dict) and item.get("type") == "tool_use":
+                            tool_name = item.get("name")
+                            break
+
+                    if model:
+                        session_meta[session_id]["model"] = model
+
+                    turns.append({
+                        "session_id": session_id,
+                        "timestamp": timestamp,
+                        "model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read": cache_read,
+                        "cache_write": cache_creation,
+                        "tool_name": tool_name,
+                        "cwd": cwd,
+                    })
+
+    except Exception as e:
+        print(f"  Warning: {filepath}: {e}")
+
+    return list(session_meta.values()), turns
+
+
+def aggregate_sessions(session_metas, turns):
+    """Aggregate turns into session-level stats."""
+    stats = defaultdict(lambda: {
+        "total_input": 0, "total_output": 0,
+        "total_cache_read": 0, "total_cache_write": 0,
+        "turn_count": 0, "model": None,
+    })
+    for t in turns:
+        s = stats[t["session_id"]]
+        s["total_input"] += t["input_tokens"]
+        s["total_output"] += t["output_tokens"]
+        s["total_cache_read"] += t["cache_read"]
+        s["total_cache_write"] += t["cache_write"]
+        s["turn_count"] += 1
+        if t["model"]:
+            s["model"] = t["model"]
+
+    result = []
+    for meta in session_metas:
+        sid = meta["session_id"]
+        s = stats[sid]
+        result.append({**meta, **s})
+    return result
+
+
+def upsert_sessions(conn, sessions):
+    for s in sessions:
+        existing = conn.execute(
+            "SELECT session_id FROM sessions WHERE session_id = ?",
+            (s["session_id"],)
+        ).fetchone()
+
+        if existing is None:
+            conn.execute("""
+                INSERT INTO sessions
+                    (session_id, project_name, project_dir, first_timestamp, last_timestamp,
+                     git_branch, total_input, total_output, total_cache_read, total_cache_write,
+                     model, turn_count, is_subagent, parent_session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                s["session_id"], s["project_name"], s.get("project_dir", ""),
+                s["first_timestamp"], s["last_timestamp"], s["git_branch"],
+                s["total_input"], s["total_output"],
+                s["total_cache_read"], s["total_cache_write"],
+                s["model"], s["turn_count"],
+                s.get("is_subagent", 0), s.get("parent_session_id"),
+            ))
+        else:
+            conn.execute("""
+                UPDATE sessions SET
+                    last_timestamp = MAX(last_timestamp, ?),
+                    total_input = total_input + ?,
+                    total_output = total_output + ?,
+                    total_cache_read = total_cache_read + ?,
+                    total_cache_write = total_cache_write + ?,
+                    turn_count = turn_count + ?,
+                    model = COALESCE(?, model)
+                WHERE session_id = ?
+            """, (
+                s["last_timestamp"],
+                s["total_input"], s["total_output"],
+                s["total_cache_read"], s["total_cache_write"],
+                s["turn_count"], s["model"],
+                s["session_id"],
+            ))
+
+
+def insert_turns(conn, turns):
+    conn.executemany("""
+        INSERT INTO turns
+            (session_id, timestamp, model, input_tokens, output_tokens,
+             cache_read, cache_write, tool_name, cwd)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (t["session_id"], t["timestamp"], t["model"],
+         t["input_tokens"], t["output_tokens"],
+         t["cache_read"], t["cache_write"],
+         t["tool_name"], t["cwd"])
+        for t in turns
+    ])
+
+
+def count_lines(filepath):
+    count = 0
+    with open(filepath, encoding="utf-8", errors="replace") as f:
+        for _ in f:
+            count += 1
+    return count
+
+
+def scan(verbose=True):
+    """Scan all JSONL files and update the database."""
+    conn = get_db()
+    init_db(conn)
+
+    jsonl_files = glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True)
+    jsonl_files.sort()
+
+    new_files = 0
+    updated_files = 0
+    skipped_files = 0
+    total_turns = 0
+    total_sessions = set()
+
+    for filepath in jsonl_files:
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+
+        row = conn.execute(
+            "SELECT mtime, lines FROM processed_files WHERE path = ?",
+            (filepath,)
+        ).fetchone()
+
+        if row and abs(row["mtime"] - mtime) < 0.01:
+            skipped_files += 1
+            continue
+
+        is_new = row is None
+        if verbose:
+            status = "NEW" if is_new else "UPD"
+            rel = os.path.relpath(filepath, PROJECTS_DIR)
+            print(f"  [{status}] {rel}")
+
+        session_metas, turns = parse_jsonl_file(filepath)
+
+        if not is_new:
+            # Incremental: only process new lines
+            old_lines = row["lines"] if row else 0
+            current_lines = count_lines(filepath)
+            if current_lines <= old_lines:
+                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
+                             (mtime, filepath))
+                conn.commit()
+                skipped_files += 1
+                continue
+
+            # Re-parse only new lines for turns
+            is_sub, parent_id = detect_subagent(filepath)
+            new_turns = []
+            try:
+                with open(filepath, encoding="utf-8", errors="replace") as f:
+                    for i, line in enumerate(f):
+                        if i < old_lines:
+                            continue
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if record.get("type") != "assistant":
+                            continue
+                        session_id = record.get("sessionId")
+                        if not session_id:
+                            continue
+                        msg = record.get("message", {})
+                        usage = msg.get("usage", {})
+                        inp = usage.get("input_tokens", 0) or 0
+                        out = usage.get("output_tokens", 0) or 0
+                        cr = usage.get("cache_read_input_tokens", 0) or 0
+                        cc = usage.get("cache_creation_input_tokens", 0) or 0
+                        if inp + out + cr + cc == 0:
+                            continue
+                        tool_name = None
+                        for item in msg.get("content", []):
+                            if isinstance(item, dict) and item.get("type") == "tool_use":
+                                tool_name = item.get("name")
+                                break
+                        new_turns.append({
+                            "session_id": session_id,
+                            "timestamp": record.get("timestamp", ""),
+                            "model": msg.get("model", ""),
+                            "input_tokens": inp,
+                            "output_tokens": out,
+                            "cache_read": cr,
+                            "cache_write": cc,
+                            "tool_name": tool_name,
+                            "cwd": record.get("cwd", ""),
+                        })
+            except Exception as e:
+                print(f"  Warning: {e}")
+
+            turns = new_turns
+            sessions = aggregate_sessions(session_metas, turns)
+            updated_files += 1
+        else:
+            sessions = aggregate_sessions(session_metas, turns)
+            new_files += 1
+
+        if sessions:
+            upsert_sessions(conn, sessions)
+        if turns:
+            insert_turns(conn, turns)
+
+        for s in sessions:
+            total_sessions.add(s["session_id"])
+        total_turns += len(turns)
+
+        line_count = count_lines(filepath)
+        conn.execute("""
+            INSERT OR REPLACE INTO processed_files (path, mtime, lines)
+            VALUES (?, ?, ?)
+        """, (filepath, mtime, line_count))
+        conn.commit()
+
+    # Import legacy JSONL history if it exists and hasn't been imported
+    legacy_imported = conn.execute(
+        "SELECT path FROM processed_files WHERE path = '__legacy_jsonl__'"
+    ).fetchone()
+
+    if not legacy_imported and HISTORY_FILE.exists():
+        if verbose:
+            print(f"\n  Importing legacy history from {HISTORY_FILE}...")
+        import_count = import_legacy_history(conn)
+        conn.execute("""
+            INSERT OR REPLACE INTO processed_files (path, mtime, lines)
+            VALUES ('__legacy_jsonl__', ?, ?)
+        """, (time.time(), import_count))
+        conn.commit()
+        if verbose:
+            print(f"  Imported {import_count} legacy sessions")
+
+    if verbose:
+        sess_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        turn_count = conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+        sub_count = conn.execute("SELECT COUNT(*) FROM sessions WHERE is_subagent = 1").fetchone()[0]
+        print(f"\nScan complete:")
+        print(f"  New files:     {new_files}")
+        print(f"  Updated:       {updated_files}")
+        print(f"  Skipped:       {skipped_files}")
+        print(f"  Turns added:   {total_turns}")
+        print(f"  DB totals:     {sess_count} sessions ({sub_count} subagents), {turn_count} turns")
+
+    conn.close()
+
+
+def import_legacy_history(conn):
+    """Import claudetop-history.jsonl sessions into the sessions table."""
+    count = 0
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                sid = rec.get("session_id", "")
+                if not sid:
+                    continue
+
+                # Skip if session already exists from JSONL scan
+                existing = conn.execute(
+                    "SELECT session_id FROM sessions WHERE session_id = ?", (sid,)
+                ).fetchone()
+                if existing:
+                    continue
+
+                ts = rec.get("timestamp", "")
+                cost = rec.get("cost_usd", 0)
+                inp = rec.get("input_tokens", 0)
+                out = rec.get("output_tokens", 0)
+
+                conn.execute("""
+                    INSERT OR IGNORE INTO sessions
+                        (session_id, project_name, project_dir, first_timestamp, last_timestamp,
+                         git_branch, total_input, total_output, total_cache_read, total_cache_write,
+                         model, turn_count, is_subagent, parent_session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, NULL)
+                """, (
+                    sid,
+                    rec.get("project", "unknown"),
+                    rec.get("project_dir", ""),
+                    ts, ts,
+                    rec.get("branch", ""),
+                    inp, out,
+                    rec.get("model", ""),
+                ))
+                count += 1
+        conn.commit()
+    except Exception as e:
+        print(f"  Warning importing legacy: {e}")
+    return count
+
+
+# ── CLI: Stats ───────────────────────────────────────────────────────────────
+
+def cmd_today():
+    if not DB_PATH.exists():
+        print("No database found. Run: claudetop-engine scan")
+        return
+    conn = get_db()
+    today = date.today().isoformat()
+
+    rows = conn.execute("""
+        SELECT
+            COALESCE(model, 'unknown') as model,
+            SUM(input_tokens)  as inp,
+            SUM(output_tokens) as out,
+            SUM(cache_read)    as cr,
+            SUM(cache_write)   as cw,
+            COUNT(*)           as turns
+        FROM turns
+        WHERE substr(timestamp, 1, 10) = ?
+        GROUP BY model
+        ORDER BY inp + out DESC
+    """, (today,)).fetchall()
+
+    sessions = conn.execute("""
+        SELECT COUNT(DISTINCT session_id) as cnt
+        FROM turns WHERE substr(timestamp, 1, 10) = ?
+    """, (today,)).fetchone()
+
+    # Subagent stats for today
+    sub_stats = conn.execute("""
+        SELECT COUNT(DISTINCT t.session_id) as sub_sessions,
+               SUM(t.input_tokens) as sub_inp,
+               SUM(t.output_tokens) as sub_out
+        FROM turns t
+        JOIN sessions s ON t.session_id = s.session_id
+        WHERE substr(t.timestamp, 1, 10) = ? AND s.is_subagent = 1
+    """, (today,)).fetchone()
+
+    # Top tools by cost today
+    tools = conn.execute("""
+        SELECT tool_name,
+               SUM(input_tokens) as inp,
+               SUM(output_tokens) as out,
+               SUM(cache_read) as cr,
+               SUM(cache_write) as cw,
+               COUNT(*) as calls
+        FROM turns
+        WHERE substr(timestamp, 1, 10) = ? AND tool_name IS NOT NULL
+        GROUP BY tool_name
+        ORDER BY inp + out DESC
+        LIMIT 8
+    """, (today,)).fetchall()
+
+    hr = "-" * 60
+    print(f"\n{hr}")
+    print(f"  claudetop — Today ({today})")
+    print(hr)
+
+    if not rows:
+        print("  No usage recorded today.\n")
+        conn.close()
+        return
+
+    total_cost = 0
+    for r in rows:
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cw"] or 0)
+        total_cost += cost
+        print(f"  {r['model']:<30}  turns={r['turns']:<4}  "
+              f"in={fmt_tokens(r['inp'] or 0):<8}  out={fmt_tokens(r['out'] or 0):<8}  "
+              f"cost={fmt_cost(cost)}")
+
+    print(hr)
+    print(f"  {'TOTAL':<30}  sessions={sessions['cnt']}  cost={fmt_cost(total_cost)}")
+
+    if sub_stats and sub_stats["sub_sessions"]:
+        sub_cost_est = calc_cost("sonnet", sub_stats["sub_inp"] or 0, sub_stats["sub_out"] or 0, 0, 0)
+        print(f"\n  Subagents: {sub_stats['sub_sessions']} sessions, ~{fmt_cost(sub_cost_est)} est.")
+
+    if tools:
+        print(f"\n  Top tools by token volume:")
+        for t in tools:
+            vol = (t["inp"] or 0) + (t["out"] or 0)
+            print(f"    {t['tool_name']:<25}  {t['calls']:>4} calls  {fmt_tokens(vol)}")
+
+    print(f"{hr}\n")
+    conn.close()
+
+
+def cmd_stats():
+    if not DB_PATH.exists():
+        print("No database found. Run: claudetop-engine scan")
+        return
+    conn = get_db()
+
+    totals = conn.execute("""
+        SELECT
+            SUM(total_input)      as inp,
+            SUM(total_output)     as out,
+            SUM(total_cache_read) as cr,
+            SUM(total_cache_write)as cw,
+            SUM(turn_count)       as turns,
+            COUNT(*)              as sessions,
+            MIN(first_timestamp)  as first_ts,
+            MAX(last_timestamp)   as last_ts
+        FROM sessions WHERE is_subagent = 0
+    """).fetchone()
+
+    sub_totals = conn.execute("""
+        SELECT COUNT(*) as sessions,
+               SUM(total_input) as inp,
+               SUM(total_output) as out,
+               SUM(turn_count) as turns
+        FROM sessions WHERE is_subagent = 1
+    """).fetchone()
+
+    by_model = conn.execute("""
+        SELECT COALESCE(model, 'unknown') as model,
+               SUM(total_input) as inp, SUM(total_output) as out,
+               SUM(total_cache_read) as cr, SUM(total_cache_write) as cw,
+               SUM(turn_count) as turns, COUNT(*) as sessions
+        FROM sessions
+        GROUP BY model ORDER BY inp + out DESC
+    """).fetchall()
+
+    top_projects = conn.execute("""
+        SELECT project_name,
+               SUM(total_input) as inp, SUM(total_output) as out,
+               SUM(total_cache_read) as cr, SUM(total_cache_write) as cw,
+               SUM(turn_count) as turns, COUNT(*) as sessions
+        FROM sessions WHERE is_subagent = 0
+        GROUP BY project_name ORDER BY inp + out DESC LIMIT 10
+    """).fetchall()
+
+    # Top tools across all time
+    top_tools = conn.execute("""
+        SELECT tool_name, COUNT(*) as calls,
+               SUM(input_tokens + output_tokens) as tokens
+        FROM turns WHERE tool_name IS NOT NULL
+        GROUP BY tool_name ORDER BY tokens DESC LIMIT 10
+    """).fetchall()
+
+    total_cost = sum(
+        calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cw"] or 0)
+        for r in by_model
+    )
+
+    hr = "=" * 60
+    print(f"\n{hr}")
+    print("  claudetop — All-Time Statistics")
+    print(hr)
+
+    first = (totals["first_ts"] or "")[:10]
+    last = (totals["last_ts"] or "")[:10]
+    print(f"  Period:          {first} to {last}")
+    print(f"  Sessions:        {totals['sessions'] or 0:,} main + {sub_totals['sessions'] or 0:,} subagents")
+    print(f"  Turns:           {fmt_tokens(totals['turns'] or 0)}")
+    print(f"  Input tokens:    {fmt_tokens(totals['inp'] or 0)}")
+    print(f"  Output tokens:   {fmt_tokens(totals['out'] or 0)}")
+    print(f"  Cache read:      {fmt_tokens(totals['cr'] or 0)}")
+    print(f"  Cache write:     {fmt_tokens(totals['cw'] or 0)}")
+    print(f"  Est. total cost: {fmt_cost(total_cost)}")
+    print("-" * 60)
+
+    print("  By Model:")
+    for r in by_model:
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cw"] or 0)
+        print(f"    {r['model']:<28}  sessions={r['sessions']:<4}  "
+              f"turns={fmt_tokens(r['turns'] or 0):<6}  cost={fmt_cost(cost)}")
+
+    print("-" * 60)
+    print("  Top Projects:")
+    for r in top_projects:
+        cost = calc_cost("sonnet", r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cw"] or 0)
+        print(f"    {(r['project_name'] or 'unknown'):<28}  sessions={r['sessions']:<3}  "
+              f"turns={fmt_tokens(r['turns'] or 0):<6}  ~{fmt_cost(cost)}")
+
+    if top_tools:
+        print("-" * 60)
+        print("  Top Tools (by token volume):")
+        for t in top_tools:
+            print(f"    {t['tool_name']:<28}  {t['calls']:>5} calls  {fmt_tokens(t['tokens'])}")
+
+    print(f"{hr}\n")
+    conn.close()
+
+
+# ── Dashboard ────────────────────────────────────────────────────────────────
+
+def get_dashboard_data():
+    if not DB_PATH.exists():
+        return {"error": "No database. Run: claudetop-engine scan"}
+    conn = get_db()
+
+    # All models for filter
+    models = [r[0] for r in conn.execute("""
+        SELECT COALESCE(model, 'unknown') FROM turns
+        GROUP BY model ORDER BY SUM(input_tokens + output_tokens) DESC
+    """).fetchall()]
+
+    # Daily per-model data
+    daily = [{
+        "day": r[0], "model": r[1],
+        "input": r[2] or 0, "output": r[3] or 0,
+        "cache_read": r[4] or 0, "cache_write": r[5] or 0,
+        "turns": r[6] or 0,
+    } for r in conn.execute("""
+        SELECT substr(timestamp, 1, 10), COALESCE(model, 'unknown'),
+               SUM(input_tokens), SUM(output_tokens),
+               SUM(cache_read), SUM(cache_write), COUNT(*)
+        FROM turns GROUP BY 1, 2 ORDER BY 1, 2
+    """).fetchall()]
+
+    # All sessions
+    sessions = []
+    for r in conn.execute("""
+        SELECT session_id, project_name, first_timestamp, last_timestamp,
+               total_input, total_output, total_cache_read, total_cache_write,
+               model, turn_count, is_subagent, parent_session_id, git_branch
+        FROM sessions ORDER BY last_timestamp DESC
+    """).fetchall():
+        try:
+            t1 = datetime.fromisoformat(r["first_timestamp"].replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(r["last_timestamp"].replace("Z", "+00:00"))
+            dur_min = round((t2 - t1).total_seconds() / 60, 1)
+        except Exception:
+            dur_min = 0
+
+        cost = calc_cost(
+            r["model"],
+            r["total_input"] or 0, r["total_output"] or 0,
+            r["total_cache_read"] or 0, r["total_cache_write"] or 0
+        )
+        sessions.append({
+            "id": r["session_id"][:8],
+            "project": r["project_name"] or "unknown",
+            "last": (r["last_timestamp"] or "")[:16].replace("T", " "),
+            "last_date": (r["last_timestamp"] or "")[:10],
+            "dur_min": dur_min,
+            "model": r["model"] or "unknown",
+            "turns": r["turn_count"] or 0,
+            "input": r["total_input"] or 0,
+            "output": r["total_output"] or 0,
+            "cache_read": r["total_cache_read"] or 0,
+            "cache_write": r["total_cache_write"] or 0,
+            "cost": round(cost, 4),
+            "is_sub": r["is_subagent"],
+            "parent": r["parent_session_id"][:8] if r["parent_session_id"] else None,
+            "branch": r["git_branch"] or "",
+        })
+
+    # Subagent summary
+    sub_stats = conn.execute("""
+        SELECT
+            COALESCE(s.parent_session_id, 'orphan') as parent,
+            COUNT(*) as count,
+            SUM(s.total_input) as inp,
+            SUM(s.total_output) as out,
+            SUM(s.total_cache_read) as cr,
+            SUM(s.total_cache_write) as cw
+        FROM sessions s WHERE s.is_subagent = 1
+        GROUP BY parent ORDER BY inp + out DESC LIMIT 20
+    """).fetchall()
+
+    subagent_data = [{
+        "parent": r["parent"][:8] if r["parent"] else "orphan",
+        "count": r["count"],
+        "input": r["inp"] or 0,
+        "output": r["out"] or 0,
+    } for r in sub_stats]
+
+    # Top tools
+    tools = [{
+        "name": r[0], "calls": r[1], "tokens": r[2],
+    } for r in conn.execute("""
+        SELECT tool_name, COUNT(*), SUM(input_tokens + output_tokens)
+        FROM turns WHERE tool_name IS NOT NULL
+        GROUP BY tool_name ORDER BY 3 DESC LIMIT 15
+    """).fetchall()]
+
+    conn.close()
+
+    return {
+        "models": models,
+        "daily": daily,
+        "sessions": sessions,
+        "subagents": subagent_data,
+        "tools": tools,
+        "pricing": {k: v for k, v in PRICING.items()},
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claudetop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:#09090b; --surface:#18181b; --surface2:#27272a; --border:#3f3f46;
+  --fg:#fafafa; --muted:#a1a1aa; --dim:#71717a;
+  --amber:#f59e0b; --amber2:#d97706; --amber-bg:rgba(245,158,11,.08);
+  --emerald:#34d399; --emerald2:#10b981; --emerald-bg:rgba(52,211,153,.08);
+  --rose:#fb7185; --rose2:#f43f5e; --rose-bg:rgba(251,113,133,.08);
+  --violet:#a78bfa; --violet2:#8b5cf6; --violet-bg:rgba(167,139,250,.08);
+  --sky:#38bdf8; --sky2:#0ea5e9; --sky-bg:rgba(56,189,248,.08);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:13px;min-height:100vh}
+
+/* ── Header ── */
+.hero{background:linear-gradient(135deg,#18181b 0%,#1c1917 50%,#18181b 100%);border-bottom:1px solid var(--border);padding:28px 32px 20px}
+.hero-inner{max-width:1480px;margin:0 auto;display:flex;align-items:flex-end;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:14px}
+.logo{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,var(--amber),var(--amber2));display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#000;flex-shrink:0}
+.brand h1{font-size:22px;font-weight:700;color:var(--fg);letter-spacing:-.02em}
+.brand h1 span{color:var(--dim);font-weight:400;font-size:14px;margin-left:8px}
+.hero-meta{color:var(--dim);font-size:11px;text-align:right}
+.hero-meta .live{color:var(--emerald);font-weight:600}
+.hero-meta .live::before{content:"";display:inline-block;width:6px;height:6px;background:var(--emerald);border-radius:50%;margin-right:5px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── Controls ── */
+.controls{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 32px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ctrl-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dim)}
+.pill-group{display:flex;gap:4px}
+.pill{padding:4px 12px;border-radius:100px;border:1px solid var(--border);background:transparent;color:var(--muted);font-size:11px;font-family:inherit;cursor:pointer;transition:.2s}
+.pill:hover{border-color:var(--amber);color:var(--fg)}
+.pill.on{background:var(--amber-bg);border-color:var(--amber);color:var(--amber);font-weight:600}
+.pill-sm{padding:3px 10px;font-size:10px}
+.divider{width:1px;height:22px;background:var(--border);margin:0 6px}
+
+/* ── Layout ── */
+.wrap{max-width:1480px;margin:0 auto;padding:24px 32px}
+
+/* ── Stat Meters ── */
+.meters{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:24px}
+@media(max-width:1100px){.meters{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.meters{grid-template-columns:1fr}}
+.meter{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;position:relative;overflow:hidden}
+.meter::before{content:"";position:absolute;top:0;left:0;right:0;height:2px}
+.meter:nth-child(1)::before{background:linear-gradient(90deg,var(--amber),transparent)}
+.meter:nth-child(2)::before{background:linear-gradient(90deg,var(--emerald),transparent)}
+.meter:nth-child(3)::before{background:linear-gradient(90deg,var(--sky),transparent)}
+.meter:nth-child(4)::before{background:linear-gradient(90deg,var(--violet),transparent)}
+.meter:nth-child(5)::before{background:linear-gradient(90deg,var(--rose),transparent)}
+.meter .label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:8px}
+.meter .val{font-size:28px;font-weight:700;letter-spacing:-.02em}
+.meter:nth-child(1) .val{color:var(--amber)}
+.meter:nth-child(2) .val{color:var(--emerald)}
+.meter:nth-child(3) .val{color:var(--sky)}
+.meter:nth-child(4) .val{color:var(--violet)}
+.meter:nth-child(5) .val{color:var(--rose)}
+.meter .sub{font-size:11px;color:var(--dim);margin-top:4px}
+.meter .bar{margin-top:10px;height:4px;background:var(--surface2);border-radius:2px;overflow:hidden}
+.meter .bar-fill{height:100%;border-radius:2px;transition:width .5s ease}
+
+/* ── Heatmap Calendar ── */
+.heatmap-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px}
+.heatmap-card h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:14px}
+.heatmap{display:flex;gap:3px;overflow-x:auto;padding-bottom:4px}
+.hm-week{display:flex;flex-direction:column;gap:3px}
+.hm-day{width:14px;height:14px;border-radius:3px;background:var(--surface2);cursor:pointer;transition:transform .1s}
+.hm-day:hover{transform:scale(1.3);z-index:1}
+.hm-day[data-level="1"]{background:rgba(245,158,11,.2)}
+.hm-day[data-level="2"]{background:rgba(245,158,11,.4)}
+.hm-day[data-level="3"]{background:rgba(245,158,11,.65)}
+.hm-day[data-level="4"]{background:var(--amber)}
+.hm-legend{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:10px;color:var(--dim)}
+.hm-legend-box{width:12px;height:12px;border-radius:2px}
+.hm-tooltip{position:fixed;background:#27272a;border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:11px;color:var(--fg);pointer-events:none;z-index:100;display:none;white-space:nowrap}
+
+/* ── Charts ── */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:24px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+.panel.w{grid-column:span 2}@media(max-width:900px){.panel.w{grid-column:span 1}}
+.panel h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:14px}
+.ch{position:relative;height:240px}
+.ch.tall{height:280px}
+
+/* ── Table ── */
+.tbl-panel{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:24px;overflow-x:auto}
+.tbl-panel h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:14px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);padding:6px 10px;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.08em;white-space:nowrap}
+th:hover{color:var(--amber)}
+th.asc::after{content:" \2191";color:var(--amber)}
+th.desc::after{content:" \2193";color:var(--amber)}
+td{padding:7px 10px;border-bottom:1px solid rgba(63,63,70,.5);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(245,158,11,.03)}
+.t-cost{color:var(--amber);font-weight:600}
+.t-model{color:var(--violet)}
+.t-proj{color:var(--sky)}
+.t-branch{color:var(--emerald)}
+.t-dim{color:var(--dim)}
+.sub-badge{font-size:9px;padding:2px 6px;border-radius:100px;background:var(--violet-bg);color:var(--violet);font-weight:600;letter-spacing:.03em}
+
+/* ── Footer ── */
+footer{border-top:1px solid var(--border);padding:20px 32px;text-align:center}
+footer p{color:var(--dim);font-size:11px}
+footer a{color:var(--amber);text-decoration:none}
+footer a:hover{text-decoration:underline}
+
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="hero-inner">
+    <div class="brand">
+      <div class="logo">ct</div>
+      <h1>claudetop <span>analytics engine</span></h1>
+    </div>
+    <div class="hero-meta">
+      <div class="live">LIVE</div>
+      <div id="meta"></div>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <span class="ctrl-label">Models</span>
+  <div class="pill-group" id="model-pills"></div>
+  <button class="pill pill-sm" onclick="toggleAll(true)">All</button>
+  <button class="pill pill-sm" onclick="toggleAll(false)">None</button>
+  <div class="divider"></div>
+  <span class="ctrl-label">Range</span>
+  <div class="pill-group">
+    <button class="pill" data-r="7d" onclick="setRange('7d')">7d</button>
+    <button class="pill" data-r="30d" onclick="setRange('30d')">30d</button>
+    <button class="pill" data-r="90d" onclick="setRange('90d')">90d</button>
+    <button class="pill" data-r="all" onclick="setRange('all')">All</button>
+  </div>
+</div>
+
+<div class="wrap">
+  <div class="meters">
+    <div class="meter"><div class="label">Est. Cost</div><div class="val" id="s-cost">-</div><div class="sub" id="s-cost-s"></div><div class="bar"><div class="bar-fill" id="bar-cost" style="width:0;background:var(--amber)"></div></div></div>
+    <div class="meter"><div class="label">Sessions</div><div class="val" id="s-sess">-</div><div class="sub" id="s-sess-s"></div><div class="bar"><div class="bar-fill" id="bar-sess" style="width:0;background:var(--emerald)"></div></div></div>
+    <div class="meter"><div class="label">Daily Average</div><div class="val" id="s-daily">-</div><div class="sub" id="s-daily-s"></div><div class="bar"><div class="bar-fill" id="bar-daily" style="width:0;background:var(--sky)"></div></div></div>
+    <div class="meter"><div class="label">Avg / Session</div><div class="val" id="s-avg">-</div><div class="sub" id="s-avg-s"></div><div class="bar"><div class="bar-fill" id="bar-avg" style="width:0;background:var(--violet)"></div></div></div>
+    <div class="meter"><div class="label">Subagent Cost</div><div class="val" id="s-sub">-</div><div class="sub" id="s-sub-s"></div><div class="bar"><div class="bar-fill" id="bar-sub" style="width:0;background:var(--rose)"></div></div></div>
+  </div>
+
+  <div class="heatmap-card">
+    <h2>Spending Activity</h2>
+    <div class="heatmap" id="heatmap"></div>
+    <div class="hm-legend">
+      <span>Less</span>
+      <div class="hm-legend-box" style="background:var(--surface2)"></div>
+      <div class="hm-legend-box" style="background:rgba(245,158,11,.2)"></div>
+      <div class="hm-legend-box" style="background:rgba(245,158,11,.4)"></div>
+      <div class="hm-legend-box" style="background:rgba(245,158,11,.65)"></div>
+      <div class="hm-legend-box" style="background:var(--amber)"></div>
+      <span>More</span>
+    </div>
+  </div>
+  <div class="hm-tooltip" id="hm-tip"></div>
+
+  <div class="grid">
+    <div class="panel w"><h2>Daily Cost by Model</h2><div class="ch tall"><canvas id="ch-daily"></canvas></div></div>
+    <div class="panel"><h2>Cost by Model</h2><div class="ch"><canvas id="ch-model"></canvas></div></div>
+    <div class="panel"><h2>Cost by Project</h2><div class="ch tall"><canvas id="ch-proj"></canvas></div></div>
+    <div class="panel"><h2>Top Tools by Token Volume</h2><div class="ch tall"><canvas id="ch-tools"></canvas></div></div>
+    <div class="panel"><h2>Subagent Cost by Parent</h2><div class="ch tall"><canvas id="ch-sub"></canvas></div></div>
+  </div>
+
+  <div class="tbl-panel"><h2>Sessions</h2>
+    <table><thead><tr>
+      <th onclick="sortBy('last')">Date</th>
+      <th onclick="sortBy('project')">Project</th>
+      <th onclick="sortBy('branch')">Branch</th>
+      <th onclick="sortBy('model')">Model</th>
+      <th onclick="sortBy('dur_min')">Duration</th>
+      <th onclick="sortBy('turns')">Turns</th>
+      <th onclick="sortBy('cost')">Cost</th>
+      <th onclick="sortBy('input')">Input</th>
+      <th onclick="sortBy('output')">Output</th>
+      <th>Type</th>
+    </tr></thead><tbody id="tbody"></tbody></table>
+  </div>
+</div>
+
+<footer><p>claudetop &middot; <a href="https://github.com/liorwn/claudetop">github.com/liorwn/claudetop</a> &middot; live &middot; refreshes every 30s</p></footer>
+
+<script>
+const D=/*DATA*/null;
+const P=D.pricing;
+const MC={opus:'#fb7185',sonnet:'#38bdf8',haiku:'#34d399',other:'#a78bfa'};
+let range='30d',selModels=new Set(D.models),sortKey='last',sortDir=-1,charts={};
+Chart.defaults.color='#a1a1aa';Chart.defaults.borderColor='#3f3f46';
+Chart.defaults.font.family="'JetBrains Mono',monospace";
+
+function init(){
+  document.getElementById('meta').textContent='Updated '+D.generated;
+  const mp=document.getElementById('model-pills');
+  D.models.forEach(m=>{
+    const b=document.createElement('button');b.className='pill on';b.textContent=shortModel(m);b.dataset.model=m;
+    b.onclick=()=>{if(selModels.has(m)){selModels.delete(m);b.classList.remove('on')}else{selModels.add(m);b.classList.add('on')}render()};
+    mp.appendChild(b);
+  });
+  document.querySelector('.pill[data-r="30d"]').classList.add('on');
+  render();
+}
+
+function setRange(r){range=r;document.querySelectorAll('.pill[data-r]').forEach(b=>b.classList.toggle('on',b.dataset.r===r));render()}
+function toggleAll(on){
+  selModels=on?new Set(D.models):new Set();
+  document.querySelectorAll('#model-pills .pill').forEach(b=>b.classList.toggle('on',on));
+  render();
+}
+
+function mfam(m){if(!m)return'other';m=m.toLowerCase();if(m.includes('opus'))return'opus';if(m.includes('sonnet'))return'sonnet';if(m.includes('haiku'))return'haiku';return'other'}
+function shortModel(m){if(!m)return'?';if(m.includes('opus'))return'Opus';if(m.includes('sonnet'))return'Sonnet';if(m.includes('haiku'))return'Haiku';return m.split('-').slice(0,2).join('-')}
+function mcost(m,inp,out,cr,cw){const f=mfam(m);const p=P[f]||P.sonnet;return inp*p.input/1e6+out*p.output/1e6+(cr||0)*p.cache_read/1e6+(cw||0)*p.cache_write/1e6}
+function fmtC(v){return v>=1?'$'+v.toFixed(2):'$'+v.toFixed(3)}
+function fmtT(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return''+n}
+function fmtD(m){if(m>=60)return Math.floor(m/60)+'h '+Math.round(m%60)+'m';return Math.round(m)+'m'}
+
+function cutoff(){
+  if(range==='all')return'1970-01-01';
+  const d=new Date();d.setDate(d.getDate()-parseInt(range));return d.toISOString().slice(0,10);
+}
+
+function filtered(){const c=cutoff();return D.sessions.filter(s=>s.last_date>=c&&selModels.has(s.model))}
+
+function render(){
+  const ss=filtered();
+  const main=ss.filter(s=>!s.is_sub),subs=ss.filter(s=>s.is_sub);
+  const total=ss.reduce((a,s)=>a+s.cost,0);
+  const subTotal=subs.reduce((a,s)=>a+s.cost,0);
+  const days=new Set(ss.map(s=>s.last_date)).size;
+  const daily=days?total/days:0;
+  const avg=main.length?total/main.length:0;
+
+  document.getElementById('s-cost').textContent=fmtC(total);
+  document.getElementById('s-cost-s').textContent=fmtT(ss.reduce((a,s)=>a+s.input,0))+' input tokens';
+  document.getElementById('s-sess').textContent=main.length;
+  document.getElementById('s-sess-s').textContent=days+' day'+(days!==1?'s':'')+', '+subs.length+' subagents';
+  document.getElementById('s-daily').textContent=fmtC(daily);
+  document.getElementById('s-daily-s').textContent='~$'+(daily*30).toFixed(0)+'/mo projected';
+  document.getElementById('s-avg').textContent=fmtC(avg);
+  document.getElementById('s-avg-s').textContent='per session';
+  document.getElementById('s-sub').textContent=fmtC(subTotal);
+  document.getElementById('s-sub-s').textContent=subs.length+' subagent sessions';
+
+  // Animate meter bars (proportional to max reasonable values)
+  const bp=v=>Math.min(100,Math.max(5,v))+'%';
+  document.getElementById('bar-cost').style.width=bp(total/200*100);
+  document.getElementById('bar-sess').style.width=bp(main.length/50*100);
+  document.getElementById('bar-daily').style.width=bp(daily/100*100);
+  document.getElementById('bar-avg').style.width=bp(avg/30*100);
+  document.getElementById('bar-sub').style.width=bp(subTotal/100*100);
+
+  drawHeatmap(ss);drawDaily(ss);drawModel(ss);drawProject(ss);drawTools();drawSubagents();drawTable(ss);
+}
+
+// ── Heatmap (GitHub-style contribution calendar) ──
+function drawHeatmap(ss){
+  const hm=document.getElementById('heatmap');hm.innerHTML='';
+  const tip=document.getElementById('hm-tip');
+  // Build day→cost map
+  const dayMap={};
+  ss.forEach(s=>{dayMap[s.last_date]=(dayMap[s.last_date]||0)+s.cost});
+  const vals=Object.values(dayMap);
+  const maxCost=Math.max(...vals,1);
+  // Generate 52 weeks back
+  const today=new Date();
+  const start=new Date(today);start.setDate(start.getDate()-363);
+  start.setDate(start.getDate()-start.getDay()); // align to Sunday
+  let d=new Date(start);
+  while(d<=today){
+    const week=document.createElement('div');week.className='hm-week';
+    for(let i=0;i<7&&d<=today;i++){
+      const ds=d.toISOString().slice(0,10);
+      const cost=dayMap[ds]||0;
+      const level=cost===0?0:cost<maxCost*.15?1:cost<maxCost*.35?2:cost<maxCost*.65?3:4;
+      const cell=document.createElement('div');cell.className='hm-day';cell.dataset.level=level;
+      cell.addEventListener('mouseenter',e=>{
+        tip.textContent=ds+': '+fmtC(cost);tip.style.display='block';
+        tip.style.left=e.pageX+10+'px';tip.style.top=e.pageY-30+'px';
+      });
+      cell.addEventListener('mouseleave',()=>{tip.style.display='none'});
+      week.appendChild(cell);
+      d.setDate(d.getDate()+1);
+    }
+    hm.appendChild(week);
+  }
+}
+
+function destroy(id){if(charts[id]){charts[id].destroy();delete charts[id]}}
+const TT={backgroundColor:'#27272a',borderColor:'#3f3f46',borderWidth:1,titleColor:'#fafafa',bodyColor:'#fafafa',padding:10,cornerRadius:8,titleFont:{weight:600}};
+const GR={color:'#3f3f46'};
+
+function drawDaily(ss){
+  destroy('daily');const c=cutoff();
+  const fd=D.daily.filter(d=>d.day>=c&&selModels.has(d.model));
+  const days=[...new Set(fd.map(d=>d.day))].sort();
+  const fams=[...new Set(fd.map(d=>mfam(d.model)))];
+  const datasets=fams.map(f=>{
+    const color=MC[f]||MC.other;
+    return{label:f.charAt(0).toUpperCase()+f.slice(1),
+      data:days.map(day=>{const rows=fd.filter(d=>d.day===day&&mfam(d.model)===f);return rows.reduce((a,r)=>a+mcost(r.model,r.input,r.output,r.cache_read,r.cache_write),0)}),
+      backgroundColor:color+'bb',borderColor:color,borderWidth:0,borderRadius:4,borderSkipped:false};
+  });
+  charts.daily=new Chart(document.getElementById('ch-daily'),{type:'bar',
+    data:{labels:days,datasets},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{labels:{padding:16,usePointStyle:true,pointStyle:'circle'}},tooltip:{...TT,callbacks:{label:c=>' '+c.dataset.label+': '+fmtC(c.parsed.y)}}},
+      scales:{x:{stacked:true,ticks:{maxTicksLimit:10,font:{size:10}},grid:GR},y:{stacked:true,ticks:{callback:v=>'$'+v.toFixed(0),font:{size:10}},grid:GR}}}
+  });
+}
+
+function drawModel(ss){
+  destroy('model');const map={};
+  ss.forEach(s=>{const f=mfam(s.model);map[f]=(map[f]||0)+s.cost});
+  const labels=Object.keys(map),data=labels.map(k=>map[k]),colors=labels.map(k=>MC[k]||MC.other);
+  charts.model=new Chart(document.getElementById('ch-model'),{type:'doughnut',
+    data:{labels:labels.map(l=>l.charAt(0).toUpperCase()+l.slice(1)),datasets:[{data,backgroundColor:colors.map(c=>c+'dd'),borderColor:'#09090b',borderWidth:3,hoverOffset:8}]},
+    options:{responsive:true,maintainAspectRatio:false,cutout:'68%',
+      plugins:{legend:{position:'right',labels:{color:'#a1a1aa',padding:16,usePointStyle:true,pointStyle:'circle',font:{size:12}}},
+        tooltip:{...TT,callbacks:{label:c=>' '+c.label+': '+fmtC(c.parsed)}}}}
+  });
+}
+
+function drawProject(ss){
+  destroy('proj');const map={};
+  ss.filter(s=>!s.is_sub).forEach(s=>{map[s.project]=(map[s.project]||0)+s.cost});
+  const pairs=Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,10).reverse();
+  if(!pairs.length)return;
+  charts.proj=new Chart(document.getElementById('ch-proj'),{type:'bar',
+    data:{labels:pairs.map(p=>p[0]),datasets:[{data:pairs.map(p=>p[1]),
+      backgroundColor:pairs.map((_,i)=>{const t=i/Math.max(pairs.length-1,1);return `rgba(56,189,248,${.3+t*.6})`}),
+      borderColor:'transparent',borderRadius:4,borderSkipped:false}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{...TT,callbacks:{label:c=>' '+fmtC(c.parsed.x)}}},
+      scales:{x:{ticks:{callback:v=>'$'+v.toFixed(0),font:{size:10}},grid:GR},y:{ticks:{font:{size:11}},grid:{display:false}}}}
+  });
+}
+
+function drawTools(){
+  destroy('tools');const t=D.tools.slice(0,10).reverse();if(!t.length)return;
+  charts.tools=new Chart(document.getElementById('ch-tools'),{type:'bar',
+    data:{labels:t.map(x=>x.name),datasets:[{data:t.map(x=>x.tokens),
+      backgroundColor:t.map((_,i)=>{const t2=i/Math.max(t.length-1,1);return `rgba(167,139,250,${.3+t2*.6})`}),
+      borderColor:'transparent',borderRadius:4,borderSkipped:false}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{...TT,callbacks:{label:c=>' '+fmtT(c.parsed.x)+' tokens'}}},
+      scales:{x:{ticks:{callback:v=>fmtT(v),font:{size:10}},grid:GR},y:{ticks:{font:{size:11}},grid:{display:false}}}}
+  });
+}
+
+function drawSubagents(){
+  destroy('sub');const s=D.subagents.slice(0,10).reverse();if(!s.length)return;
+  const costs=s.map(x=>mcost('sonnet',x.input,x.output,0,0));
+  charts.sub=new Chart(document.getElementById('ch-sub'),{type:'bar',
+    data:{labels:s.map(x=>x.parent+' ('+x.count+')'),datasets:[{data:costs,
+      backgroundColor:s.map((_,i)=>{const t=i/Math.max(s.length-1,1);return `rgba(251,113,133,${.3+t*.6})`}),
+      borderColor:'transparent',borderRadius:4,borderSkipped:false}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{...TT,callbacks:{label:c=>' ~'+fmtC(c.parsed.x)}}},
+      scales:{x:{ticks:{callback:v=>'$'+v.toFixed(0),font:{size:10}},grid:GR},y:{ticks:{font:{size:11}},grid:{display:false}}}}
+  });
+}
+
+function sortBy(key){if(sortKey===key)sortDir*=-1;else{sortKey=key;sortDir=-1}render()}
+
+function drawTable(ss){
+  const sorted=[...ss].sort((a,b)=>{
+    let av=a[sortKey],bv=b[sortKey];
+    if(typeof av==='string')return sortDir*av.localeCompare(bv);
+    return sortDir*((av||0)-(bv||0));
+  });
+  const tb=document.getElementById('tbody');tb.innerHTML='';
+  document.querySelectorAll('th').forEach(th=>{th.classList.remove('asc','desc')});
+  sorted.slice(0,200).forEach(s=>{
+    const tr=document.createElement('tr');
+    const type=s.is_sub?'<span class="sub-badge">SUB</span>':'';
+    tr.innerHTML=`<td class="t-dim">${s.last}</td><td class="t-proj">${s.project}</td><td class="t-branch">${s.branch}</td><td class="t-model">${shortModel(s.model)}</td><td>${fmtD(s.dur_min)}</td><td>${s.turns}</td><td class="t-cost">${fmtC(s.cost)}</td><td>${fmtT(s.input)}</td><td>${fmtT(s.output)}</td><td>${type}</td>`;
+    tb.appendChild(tr);
+  });
+  if(sorted.length>200){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td colspan="10" class="t-dim" style="text-align:center">... and ${sorted.length-200} more</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+init();
+setInterval(()=>fetch('/api/data').then(r=>r.json()).then(d=>{Object.assign(D,d);render()}).catch(()=>{}),30000);
+</script>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # silence request logs
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/data":
+            data = get_dashboard_data()
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            data = get_dashboard_data()
+            html = DASHBOARD_HTML.replace(
+                "const D=/*DATA*/null;",
+                f"const D={json.dumps(data)};"
+            )
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+def cmd_dashboard(port=8080):
+    print("Running scan first...")
+    scan()
+    print(f"\nStarting dashboard at http://localhost:{port}")
+
+    def open_browser():
+        time.sleep(1.0)
+        webbrowser.open(f"http://localhost:{port}")
+
+    t = threading.Thread(target=open_browser, daemon=True)
+    t.start()
+
+    server = HTTPServer(("", port), DashboardHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+USAGE = """
+claudetop-engine — Analytics engine for claudetop
+
+Usage:
+  claudetop-engine scan        Scan JSONL files → ~/.claude/claudetop.db
+  claudetop-engine today       Today's usage summary
+  claudetop-engine stats       All-time statistics
+  claudetop-engine dashboard   Scan + start dashboard at localhost:8080
+
+Features over basic claudetop-stats:
+  • Scans ALL session JSONL files (not just hook-recorded sessions)
+  • Per-turn granularity (which tools cost the most)
+  • Subagent cost attribution
+  • Interactive web dashboard with charts
+  • SQLite backend for fast queries
+"""
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "scan":
+        print(f"Scanning {PROJECTS_DIR} ...")
+        scan()
+    elif cmd == "today":
+        cmd_today()
+    elif cmd == "stats":
+        cmd_stats()
+    elif cmd == "dashboard":
+        port = 8080
+        if len(sys.argv) > 2:
+            try:
+                port = int(sys.argv[2])
+            except ValueError:
+                pass
+        cmd_dashboard(port)
+    else:
+        print(USAGE)
+        sys.exit(0)
