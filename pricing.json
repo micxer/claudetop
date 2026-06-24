@@ -20,7 +20,7 @@
       "output": 15.00,
       "long_context_input": 6.00,
       "long_context_output": 22.50,
-      "long_context_threshold": 200000
+      "long_context_threshold": 10000000
     },
     "haiku": {
       "match": "haiku",
