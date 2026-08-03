@@ -8,6 +8,9 @@
 # Environment variables:
 #   CLAUDETOP_THEME          compact|minimal|full (default: full)
 #   CLAUDETOP_DAILY_BUDGET   daily budget in USD (e.g., 50)
+#   CLAUDETOP_COST_UPLIFT    multiplier applied to raw per-token API cost to
+#                            reflect actual billed cost (default: 1.35 — a
+#                            confirmed 35% uplift over raw token cost)
 #   CLAUDETOP_TAG            tag for session tracking (e.g., "auth-refactor")
 #   CLAUDETOP_ITERM          iTerm2 integration (default: off)
 #                            title     — set tab/window title with cost & model
@@ -143,35 +146,52 @@ if [ -f "$PRICING_FILE" ]; then
     .models.opus.input, (.models.opus.cache_write_5min // .models.opus.cache_write // (.models.opus.input * 1.25)), .models.opus.cache_read, .models.opus.output,
     .models.sonnet.input, (.models.sonnet.cache_write_5min // .models.sonnet.cache_write // (.models.sonnet.input * 1.25)), .models.sonnet.cache_read, .models.sonnet.output,
     .models.haiku.input, (.models.haiku.cache_write_5min // .models.haiku.cache_write // (.models.haiku.input * 1.25)), .models.haiku.cache_read, .models.haiku.output,
-    (.models.sonnet.long_context_input // 0), (.models.sonnet.long_context_output // 0), (.models.sonnet.long_context_threshold // 0)
+    (.models.fable.input // 10), (.models.fable.cache_write_5min // .models.fable.cache_write // 12.5), (.models.fable.cache_read // 1.0), (.models.fable.output // 50),
+    (.models.sonnet5_intro.input // 0), (.models.sonnet5_intro.cache_write_5min // .models.sonnet5_intro.cache_write // 0), (.models.sonnet5_intro.cache_read // 0), (.models.sonnet5_intro.output // 0), (.models.sonnet5_intro.expires // "")
   ] | @tsv' "$PRICING_FILE" 2>/dev/null) || PRICES=""
 fi
 
 if [ -n "${PRICES:-}" ]; then
-  read -r O_IN O_CW O_CR O_OUT S_IN S_CW S_CR S_OUT H_IN H_CW H_CR H_OUT S_LC_IN S_LC_OUT S_LC_THRESH <<< "$PRICES"
+  read -r O_IN O_CW O_CR O_OUT S_IN S_CW S_CR S_OUT H_IN H_CW H_CR H_OUT F_IN F_CW F_CR F_OUT S5_IN S5_CW S5_CR S5_OUT S5_EXPIRES <<< "$PRICES"
 else
-  # Hardcoded fallback (Claude 4.6 pricing as of March 2026)
+  # Hardcoded fallback (Claude 4.6/5 pricing as of August 2026)
   O_IN=5; O_CW=6.25; O_CR=0.50; O_OUT=25
   S_IN=3; S_CW=3.75; S_CR=0.30; S_OUT=15
   H_IN=1; H_CW=1.25; H_CR=0.10; H_OUT=5
-  S_LC_IN=6; S_LC_OUT=22.50; S_LC_THRESH=200000
+  F_IN=10; F_CW=12.5; F_CR=1.0; F_OUT=50
+  S5_IN=2; S5_CW=2.5; S5_CR=0.2; S5_OUT=10; S5_EXPIRES="2026-08-31"
 fi
 
-# --- Sonnet long-context pricing ---
-# If total input tokens exceed threshold, Sonnet gets more expensive
-S_EFF_IN="$S_IN"
-S_EFF_OUT="$S_OUT"
-S_EFF_CW="$S_CW"
-if [ "${S_LC_THRESH:-0}" -gt 0 ] && [ "$INPUT_TOKENS" -gt "${S_LC_THRESH}" ]; then
-  S_EFF_IN="${S_LC_IN}"
-  S_EFF_OUT="${S_LC_OUT}"
-  S_EFF_CW=$(echo "scale=2; $S_LC_IN * 1.25" | bc)
-fi
+# --- Sonnet 5 introductory pricing ---
+# Sonnet 5 is billed at a lower introductory rate until S5_EXPIRES; other
+# Sonnet versions (4.6, etc.) always use the standard "sonnet" bucket rates.
+case "$MODEL_ID" in
+  *sonnet-5*)
+    TODAY_ISO=$(date +%Y-%m-%d)
+    if [ -n "${S5_EXPIRES:-}" ] && [ "$(echo "$S5_IN > 0" | bc 2>/dev/null)" = "1" ] && [[ ! "$TODAY_ISO" > "$S5_EXPIRES" ]]; then
+      S_IN="$S5_IN"; S_CW="$S5_CW"; S_CR="$S5_CR"; S_OUT="$S5_OUT"
+    fi
+    ;;
+esac
 
 # --- Cost estimates per model (cache-aware, dynamic pricing) ---
+# Note: Sonnet no longer has a separate long-context pricing tier — flat
+# rate regardless of input size.
 OPUS_COST=$(calc_cost   "$O_IN" "$O_CW" "$O_CR" "$O_OUT")
-SONNET_COST=$(calc_cost "$S_EFF_IN" "$S_EFF_CW" "$S_CR" "$S_EFF_OUT")
+SONNET_COST=$(calc_cost "$S_IN" "$S_CW" "$S_CR" "$S_OUT")
 HAIKU_COST=$(calc_cost  "$H_IN" "$H_CW" "$H_CR" "$H_OUT")
+FABLE_COST=$(calc_cost  "$F_IN" "$F_CW" "$F_CR" "$F_OUT")
+
+# --- Billed-cost uplift ---
+# Actual API billing runs ~35% higher than raw per-token list pricing
+# (confirmed). Our OPUS/SONNET/HAIKU/FABLE figures are raw-token estimates,
+# so apply the uplift to make them comparable to the real ACTUAL_COST figure
+# (which already reflects true billed cost from Claude Code itself).
+COST_UPLIFT="${CLAUDETOP_COST_UPLIFT:-1.35}"
+OPUS_COST=$(echo "scale=6; $OPUS_COST * $COST_UPLIFT" | bc)
+SONNET_COST=$(echo "scale=6; $SONNET_COST * $COST_UPLIFT" | bc)
+HAIKU_COST=$(echo "scale=6; $HAIKU_COST * $COST_UPLIFT" | bc)
+FABLE_COST=$(echo "scale=6; $FABLE_COST * $COST_UPLIFT" | bc)
 
 ACTUAL_COST_FMT=$(fmt_cost "$COST")
 
@@ -181,27 +201,33 @@ ACTUAL_COST_FMT=$(fmt_cost "$COST")
 # and Opus estimate becomes ~$8.30 instead of a misleading ~$0.89.
 STALE_SCALE="1"
 case "$MODEL_ID" in
-  *opus*)   _BASE_COST="$OPUS_COST" ;;
-  *sonnet*) _BASE_COST="$SONNET_COST" ;;
-  *haiku*)  _BASE_COST="$HAIKU_COST" ;;
-  *)        _BASE_COST="0" ;;
+  *opus*)          _BASE_COST="$OPUS_COST" ;;
+  *fable*|*mythos*) _BASE_COST="$FABLE_COST" ;;
+  *sonnet*)        _BASE_COST="$SONNET_COST" ;;
+  *haiku*)         _BASE_COST="$HAIKU_COST" ;;
+  *)               _BASE_COST="0" ;;
 esac
 if [ "$(echo "$_BASE_COST > 0 && $COST / $_BASE_COST > 1.5" | bc 2>/dev/null)" = "1" ]; then
   STALE_SCALE=$(echo "scale=4; $COST / $_BASE_COST" | bc)
   OPUS_COST=$(echo "scale=4; $OPUS_COST * $STALE_SCALE" | bc)
   SONNET_COST=$(echo "scale=4; $SONNET_COST * $STALE_SCALE" | bc)
   HAIKU_COST=$(echo "scale=4; $HAIKU_COST * $STALE_SCALE" | bc)
+  FABLE_COST=$(echo "scale=4; $FABLE_COST * $STALE_SCALE" | bc)
 fi
 
 # Model estimates always prefixed with ~ (they're approximations)
 OPUS_COST_FMT="~$(fmt_cost "$OPUS_COST")"
 SONNET_COST_FMT="~$(fmt_cost "$SONNET_COST")"
 HAIKU_COST_FMT="~$(fmt_cost "$HAIKU_COST")"
+FABLE_COST_FMT="~$(fmt_cost "$FABLE_COST")"
 
 # Highlight current model (scaled estimates are accurate, no * needed)
 case "$MODEL_ID" in
   *opus*)
     OPUS_COST_FMT="${BOLD}${OPUS_COST_FMT}${RESET}${DIM}"
+    ;;
+  *fable*|*mythos*)
+    FABLE_COST_FMT="${BOLD}${FABLE_COST_FMT}${RESET}${DIM}"
     ;;
   *sonnet*)
     SONNET_COST_FMT="${BOLD}${SONNET_COST_FMT}${RESET}${DIM}"
@@ -516,7 +542,7 @@ else
   if [ -n "$EFFICIENCY" ]; then
     printf "  ${DIM}efficiency:${RESET} %b" "$EFFICIENCY"
   fi
-  printf "${DIM}  opus:%b  sonnet:%b  haiku:%b${RESET}" "$OPUS_COST_FMT" "$SONNET_COST_FMT" "$HAIKU_COST_FMT"
+  printf "${DIM}  opus:%b  sonnet:%b  haiku:%b  fable:%b${RESET}" "$OPUS_COST_FMT" "$SONNET_COST_FMT" "$HAIKU_COST_FMT" "$FABLE_COST_FMT"
   echo ""
 
   # Line 4 (optional): Context composition (when there's data)
