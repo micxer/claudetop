@@ -88,8 +88,8 @@ fi
 
 # 8. Install claudetop-engine (analytics + dashboard)
 ENGINE_SRC="$SCRIPT_DIR/claudetop-engine"
-ENGINE_DEST="/usr/local/bin/claudetop-engine"
-DASHBOARD_DEST="/usr/local/bin/claudetop-dashboard"
+ENGINE_DEST="$HOME/.local/bin/claudetop-engine"
+DASHBOARD_DEST="$HOME/.local/bin/claudetop-dashboard"
 if [ -f "$ENGINE_SRC" ]; then
   if [ -w "$(dirname "$ENGINE_DEST")" ]; then
     cp "$ENGINE_SRC" "$ENGINE_DEST"
