@@ -1,47 +1,38 @@
 {
-  "_updated": "2026-08-03",
-  "_source": "claude-api skill / platform.claude.com pricing docs",
-  "_notes": "Cache write 5min=1.25x, 1hr=2.0x input. Cache read=0.1x input. Batch=50% off (not used by Claude Code). Extended thinking=standard output rate. Sonnet no longer has a separate long-context pricing tier (flat rate regardless of input size). Sonnet 5 has introductory pricing ($2/$10) through 2026-08-31, reverting to standard ($3/$15) after.",
+  "_updated": "2026-10-16",
+  "_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "_notes": "Each family entry holds the rates of its newest model: Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1. Cache write 5min=1.25x, 1hr=2.0x input. Cache read=0.1x input, except Opus 5.5 and Sonnet 5.5 (0.05x) and Fable 5.1 / Mythos 5.1 (0.025x). Batch=50% off (not used by Claude Code). Extended thinking=standard output rate. No long-context surcharge for Opus/Sonnet. Haiku 5.5 is tiered per request: rates below are for prompts up to 100k tokens; prompts over 100k tokens cost $0.50 in / $0.625 cache write 5min / $1.00 cache write 1hr / $0.05 cache read / $2.50 out. Sonnet 5 introductory pricing ($2/$10) became permanent; the planned 2026-09-01 increase to $3/$15 was cancelled. Older models (Opus 4.5-5 at $5/$25, Sonnet 4.x at $3/$15, Haiku 4.5 at $1/$5, Fable 5 cache read $1.00) are not tracked separately.",
   "models": {
     "opus": {
       "match": "opus",
-      "input": 5.0,
-      "cache_write_5min": 6.25,
-      "cache_write_1hr": 10.0,
-      "cache_read": 0.5,
-      "output": 25.0
+      "input": 4.0,
+      "cache_write_5min": 5.0,
+      "cache_write_1hr": 8.0,
+      "cache_read": 0.2,
+      "output": 20.0
     },
     "sonnet": {
       "match": "sonnet",
-      "input": 3.0,
-      "cache_write_5min": 3.75,
-      "cache_write_1hr": 6.0,
-      "cache_read": 0.3,
-      "output": 15.0
-    },
-    "sonnet5_intro": {
-      "match": "sonnet-5",
-      "expires": "2026-08-31",
       "input": 2.0,
       "cache_write_5min": 2.5,
       "cache_write_1hr": 4.0,
-      "cache_read": 0.2,
+      "cache_read": 0.1,
       "output": 10.0
     },
     "haiku": {
       "match": "haiku",
-      "input": 1.0,
-      "cache_write_5min": 1.25,
-      "cache_write_1hr": 2.0,
-      "cache_read": 0.1,
-      "output": 5.0
+      "input": 0.1,
+      "cache_write_5min": 0.125,
+      "cache_write_1hr": 0.2,
+      "cache_read": 0.01,
+      "output": 0.5
     },
     "fable": {
       "match": "fable|mythos",
       "input": 10.0,
       "cache_write_5min": 12.5,
       "cache_write_1hr": 20.0,
-      "cache_read": 1.0,
+      "cache_read": 0.25,
       "output": 50.0
     }
   }

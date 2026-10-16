@@ -277,13 +277,14 @@ Make it executable, drop it in `~/.claude/claudetop.d/`, done.
 
 Pricing updates daily from this repo. When Anthropic changes prices, we update [pricing.json](pricing.json) and everyone gets the new rates next morning.
 
-Current pricing (Claude 4.6, March 2026):
+Current pricing (newest model per family, October 2026):
 
-| Model | Input | Cache Write | Cache Read | Output | Notes |
-|-------|-------|-------------|------------|--------|-------|
-| Opus 4.6 | $5/MTok | $6.25/MTok | $0.50/MTok | $25/MTok | |
-| Sonnet 4.6 | $3/MTok | $3.75/MTok | $0.30/MTok | $15/MTok | 2x input / 1.5x output when >200K tokens |
-| Haiku 4.5 | $1/MTok | $1.25/MTok | $0.10/MTok | $5/MTok | |
+| Model | Input | Cache Write (5m) | Cache Read | Output | Notes |
+|-------|-------|------------------|------------|--------|-------|
+| Opus 5.5 | $4/MTok | $5/MTok | $0.20/MTok | $20/MTok | |
+| Sonnet 5.5 | $2/MTok | $2.50/MTok | $0.10/MTok | $10/MTok | |
+| Haiku 5.5 | $0.10/MTok | $0.125/MTok | $0.01/MTok | $0.50/MTok | Prompts over 100K tokens: $0.50 in / $2.50 out. claudetop uses the lower tier. |
+| Fable 5.1 | $10/MTok | $12.50/MTok | $0.25/MTok | $50/MTok | |
 
 Extended thinking tokens are billed at standard output rates. No additional charge.
 
