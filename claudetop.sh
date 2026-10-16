@@ -146,33 +146,20 @@ if [ -f "$PRICING_FILE" ]; then
     .models.opus.input, (.models.opus.cache_write_5min // .models.opus.cache_write // (.models.opus.input * 1.25)), .models.opus.cache_read, .models.opus.output,
     .models.sonnet.input, (.models.sonnet.cache_write_5min // .models.sonnet.cache_write // (.models.sonnet.input * 1.25)), .models.sonnet.cache_read, .models.sonnet.output,
     .models.haiku.input, (.models.haiku.cache_write_5min // .models.haiku.cache_write // (.models.haiku.input * 1.25)), .models.haiku.cache_read, .models.haiku.output,
-    (.models.fable.input // 10), (.models.fable.cache_write_5min // .models.fable.cache_write // 12.5), (.models.fable.cache_read // 1.0), (.models.fable.output // 50),
-    (.models.sonnet5_intro.input // 0), (.models.sonnet5_intro.cache_write_5min // .models.sonnet5_intro.cache_write // 0), (.models.sonnet5_intro.cache_read // 0), (.models.sonnet5_intro.output // 0), (.models.sonnet5_intro.expires // "")
+    (.models.fable.input // 10), (.models.fable.cache_write_5min // .models.fable.cache_write // 12.5), (.models.fable.cache_read // 0.25), (.models.fable.output // 50)
   ] | @tsv' "$PRICING_FILE" 2>/dev/null) || PRICES=""
 fi
 
 if [ -n "${PRICES:-}" ]; then
-  read -r O_IN O_CW O_CR O_OUT S_IN S_CW S_CR S_OUT H_IN H_CW H_CR H_OUT F_IN F_CW F_CR F_OUT S5_IN S5_CW S5_CR S5_OUT S5_EXPIRES <<< "$PRICES"
+  read -r O_IN O_CW O_CR O_OUT S_IN S_CW S_CR S_OUT H_IN H_CW H_CR H_OUT F_IN F_CW F_CR F_OUT <<< "$PRICES"
 else
-  # Hardcoded fallback (Claude 4.6/5 pricing as of August 2026)
-  O_IN=5; O_CW=6.25; O_CR=0.50; O_OUT=25
-  S_IN=3; S_CW=3.75; S_CR=0.30; S_OUT=15
-  H_IN=1; H_CW=1.25; H_CR=0.10; H_OUT=5
-  F_IN=10; F_CW=12.5; F_CR=1.0; F_OUT=50
-  S5_IN=2; S5_CW=2.5; S5_CR=0.2; S5_OUT=10; S5_EXPIRES="2026-08-31"
+  # Hardcoded fallback (newest model per family as of October 2026:
+  # Opus 5.5, Sonnet 5.5, Haiku 5.5 up to 100k-token prompts, Fable 5.1)
+  O_IN=4; O_CW=5; O_CR=0.20; O_OUT=20
+  S_IN=2; S_CW=2.5; S_CR=0.10; S_OUT=10
+  H_IN=0.10; H_CW=0.125; H_CR=0.01; H_OUT=0.50
+  F_IN=10; F_CW=12.5; F_CR=0.25; F_OUT=50
 fi
-
-# --- Sonnet 5 introductory pricing ---
-# Sonnet 5 is billed at a lower introductory rate until S5_EXPIRES; other
-# Sonnet versions (4.6, etc.) always use the standard "sonnet" bucket rates.
-case "$MODEL_ID" in
-  *sonnet-5*)
-    TODAY_ISO=$(date +%Y-%m-%d)
-    if [ -n "${S5_EXPIRES:-}" ] && [ "$(echo "$S5_IN > 0" | bc 2>/dev/null)" = "1" ] && [[ ! "$TODAY_ISO" > "$S5_EXPIRES" ]]; then
-      S_IN="$S5_IN"; S_CW="$S5_CW"; S_CR="$S5_CR"; S_OUT="$S5_OUT"
-    fi
-    ;;
-esac
 
 # --- Cost estimates per model (cache-aware, dynamic pricing) ---
 # Note: Sonnet no longer has a separate long-context pricing tier — flat
