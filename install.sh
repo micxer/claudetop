@@ -125,15 +125,6 @@ if [ -f "$ITERM_HOOK_SRC" ]; then
   elif [ -f "$HOME/.bashrc" ]; then
     SHELL_RC="$HOME/.bashrc"
   fi
-
-  if [ -n "$SHELL_RC" ] && ! grep -q "claudetop-iterm-hook" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# claudetop iTerm2 integration (tab title, badge, background color)" >> "$SHELL_RC"
-    echo "$SOURCE_LINE" >> "$SHELL_RC"
-    echo "  Added iTerm2 hook to $SHELL_RC"
-  else
-    echo "  iTerm2 hook already in shell profile (skipped)"
-  fi
 fi
 
 # 9. Copy pricing updater + fetch initial pricing
